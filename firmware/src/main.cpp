@@ -18,7 +18,7 @@
 #include "esp_timer.h"
 
 #define TEST_LOOPBACK 1
-#define TEST_FPS 2000
+#define TEST_FPS 3000
 #define TEST_IDS 40
 
 #define CAN_TX_PIN 5
@@ -94,6 +94,7 @@ void generateTestFrames() {
 #endif
 
 void setup() {
+  Serial.setTxBufferSize(16384);   // must come before begin(); the default is tiny
   Serial.begin(2000000);
   Serial.setTxTimeoutMs(0);   // drop data rather than block when nothing is reading
 
