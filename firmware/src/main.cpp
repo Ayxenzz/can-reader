@@ -2,9 +2,12 @@
 // Frame line  ts_us,id_hex,ext,dlc,data_hex
 // Status line # stat,frames,missed,rxqueue,buserrors,state,usbdropped   (once per second)
 //
-// TEST_LOOPBACK 1 generates frames inside the chip. No transceiver or car needed.
+// TEST_LOOPBACK 1 generates frames inside the chip. No transceiver or car needed,
+// but GPIO 4 (RX) must be jumpered to GPIO 5 (TX), or the controller sees its own
+// bits as errors and goes bus-off.
 // In that mode the chip transmits, so NEVER connect it to a car while it is on.
-// Set it to 0 for real reading (listen-only, nothing is ever transmitted).
+// Set it to 0 for real reading (listen-only, nothing is ever transmitted),
+// and remove the jumper.
 //
 // TEST_FPS is the generated frame rate. At 500 kbit/s a full 8-byte frame takes about
 // 250 us on the wire, so the ceiling is roughly 4000. 2000 is about 50 percent bus load,
@@ -94,47 +97,4 @@ void setup() {
   Serial.begin(2000000);
   Serial.setTxTimeoutMs(0);   // drop data rather than block when nothing is reading
 
-#if TEST_LOOPBACK
-  const twai_mode_t mode = TWAI_MODE_NO_ACK;
-#else
-  const twai_mode_t mode = TWAI_MODE_LISTEN_ONLY;
-#endif
-
-  twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(
-      (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, mode);
-  g.rx_queue_len = 256;
-  g.tx_queue_len = 32;
-  twai_timing_config_t t = TIMING_CONFIG;
-  twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-
-  if (twai_driver_install(&g, &t, &f) != ESP_OK || twai_start() != ESP_OK) {
-    Serial.println("# twai start failed");
-    return;
-  }
-  Serial.println(TEST_LOOPBACK ? "# ready (loopback test mode)" : "# ready (listen only)");
-}
-
-void loop() {
-#if TEST_LOOPBACK
-  generateTestFrames();
-#endif
-
-  uint32_t now = millis();
-  if (now - lastStat >= 1000) {
-    lastStat = now;
-    twai_status_info_t s;
-    if (twai_get_status_info(&s) == ESP_OK) {
-      Serial.printf("# stat,%lu,%lu,%lu,%lu,%d,%lu\n", (unsigned long)frames,
-                    (unsigned long)s.rx_missed_count, (unsigned long)s.msgs_to_rx,
-                    (unsigned long)s.bus_error_count, (int)s.state,
-                    (unsigned long)usbDropped);
-    }
-  }
-
-  twai_message_t m;
-  if (twai_receive(&m, pdMS_TO_TICKS(1)) != ESP_OK) return;
-  do {
-    emit(m);
-  } while (twai_receive(&m, 0) == ESP_OK);
-  flushOut();   // one USB write per batch instead of one per frame
-}
+#
