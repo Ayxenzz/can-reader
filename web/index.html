@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAN reader</title>
+<style>
+  :root { color-scheme: light dark; font: 14px system-ui, sans-serif; }
+  body { margin: 0; padding: 12px; }
+  button { padding: 10px 18px; font-size: 15px; }
+  #info { margin: 10px 0; font: 12px ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; }
+  .wrap { overflow-x: auto; }
+  table { border-collapse: collapse; font: 13px ui-monospace, monospace; width: 100%; }
+  th, td { padding: 3px 6px; text-align: left; border-bottom: 1px solid #8884; white-space: nowrap; }
+  td.n { text-align: right; }
+  .b { display: inline-block; width: 2.2ch; text-align: center; }
+</style>
+</head>
+<body>
+<button id="btn">Connect</button>
+<div id="info">Not connected.</div>
+<div class="wrap">
+  <table>
+    <thead><tr><th>ID</th><th>Count</th><th>ms</th><th>Data</th></tr></thead>
+    <tbody id="body"></tbody>
+  </table>
+</div>
+
+<script>
+const btn = document.getElementById('btn');
+const info = document.getElementById('info');
+const body = document.getElementById('body');
+
+const rows = new Map();
+const dirty = new Set();
+let needSort = false;
+let total = 0, lastTotal = 0, bad = 0, bytes = 0, lastBytes = 0;
+let dev = '', status = 'Not connected.';
+let port = null, reader = null;
+
+function onLine(s) {
+  s = s.trim();
+  if (!s) return;
+  if (s[0] === '#') { dev = s; return; }
+  const p = s.split(',');
+  if (p.length !== 5) { bad++; return; }
+  const ts = Number(p[0]), id = parseInt(p[1], 16), ext = p[2];
+  const dlc = Number(p[3]), hex = p[4];
+  if (isNaN(ts) || isNaN(id) || (ext !== '0' && ext !== '1') ||
+      !(dlc >= 0 && dlc <= 8) || hex.length !== dlc * 2 || /[^0-9A-F]/.test(hex)) {
+    bad++; return;
+  }
+  const key = ext + ':' + id;
+  let r = rows.get(key);
+  if (!r) {
+    r = { id, ext, count: 0, ts: 0, period: 0, dlc: 0, bytes: [], chg: [], tr: null, c: null };
+    rows.set(key, r);
+    needSort = true;
+  }
+  r.count++;
+  if (r.ts) r.period = (ts - r.ts) / 1000;
+  r.ts = ts;
+  r.dlc = dlc;
+  for (let i = 0; i < dlc; i++) {
+    const v = parseInt(hex.substr(i * 2, 2), 16);
+    if (r.bytes[i] !== undefined && r.bytes[i] !== v) r.chg[i] = true;
+    r.bytes[i] = v;
+  }
+  r.bytes.length = dlc;
+  dirty.add(r);
+  total++;
+}
+
+function makeRow(r) {
+  const tr = document.createElement('tr');
+  const mk = (txt, cls) => { const td = document.createElement('td'); if (cls) td.className = cls; td.textContent = txt; tr.appendChild(td); return td; };
+  mk(r.id.toString(16).toUpperCase().padStart(r.ext === '1' ? 8 : 3, '0'));   // 8 digits = 29-bit, 3 = 11-bit
+  const count = mk('', 'n');
+  const period = mk('', 'n');
+  const data = mk('');
+  const spans = [];
+  for (let i = 0; i < 8; i++) {
+    const sp = document.createElement('span');
+    sp.className = 'b';
+    data.appendChild(sp);
+    spans.push(sp);
+  }
+  r.tr = tr;
+  r.c = { count, period, spans };
+}
+
+function paint() {
+  if (needSort) {
+    for (const r of rows.values()) if (!r.tr) makeRow(r);
+    const all = [...rows.values()].sort((a, b) => a.ext - b.ext || a.id - b.id);
+    for (const r of all) body.appendChild(r.tr);   // re-appending moves the node
+    needSort = false;
+  }
+  for (const r of dirty) {
+    r.c.count.textContent = r.count;
+    r.c.period.textContent = r.period ? r.period.toFixed(1) : '';
+    for (let i = 0; i < 8; i++) {
+      const sp = r.c.spans[i];
+      sp.textContent = i < r.dlc ? r.bytes[i].toString(16).toUpperCase().padStart(2, '0') : '';
+      if (r.chg[i]) {
+        r.chg[i] = false;
+        sp.animate([{ background: '#e8b400', color: '#000' }, { background: 'transparent' }], { duration: 1000 });
+      }
+    }
+  }
+  dirty.clear();
+  requestAnimationFrame(paint);
+}
+
+setInterval(() => {
+  const fps = total - lastTotal;
+  const kbs = (bytes - lastBytes) / 1024;
+  lastTotal = total;
+  lastBytes = bytes;
+  info.textContent = status +
+    '\nframes/s ' + fps + '   KB/s ' + kbs.toFixed(1) +
+    '\ntotal ' + total + '   ids ' + rows.size + '   malformed ' + bad +
+    '\n' + dev;
+}, 1000);
+
+async function connect() {
+  if (!('serial' in navigator)) { status = 'Web Serial is not available in this browser.'; return; }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 2000000, bufferSize: 65536 });
+  } catch (e) { status = 'Could not open port. ' + e.message; return; }
+
+  status = 'Connected.';
+  btn.textContent = 'Disconnect';
+  const dec = new TextDecoder();
+  let buf = '', first = true;
+  reader = port.readable.getReader();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytes += value.length;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i);
+        buf = buf.slice(i + 1);
+        if (first) { first = false; continue; }   // first piece may be a cut-off line
+        onLine(line);
+      }
+      if (buf.length > 1000) buf = '';
+    }
+  } catch (e) {
+    status = 'Read error. ' + e.message;
+  } finally {
+    try { reader.releaseLock(); await port.close(); } catch (e) {}
+    reader = null; port = null;
+    btn.textContent = 'Connect';
+    if (status === 'Connected.') status = 'Disconnected.';
+  }
+}
+
+btn.onclick = () => { if (reader) reader.cancel(); else connect(); };
+requestAnimationFrame(paint);
+</script>
+</body>
+</html>
