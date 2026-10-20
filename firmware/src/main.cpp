@@ -97,4 +97,49 @@ void setup() {
   Serial.begin(2000000);
   Serial.setTxTimeoutMs(0);   // drop data rather than block when nothing is reading
 
-#
+#if TEST_LOOPBACK
+  const twai_mode_t mode = TWAI_MODE_NO_ACK;
+#else
+  const twai_mode_t mode = TWAI_MODE_LISTEN_ONLY;
+#endif
+
+  twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(
+      (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, mode);
+  g.rx_queue_len = 256;
+  g.tx_queue_len = 32;
+  twai_timing_config_t t = TIMING_CONFIG;
+  twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  if (twai_driver_install(&g, &t, &f) != ESP_OK || twai_start() != ESP_OK) {
+    Serial.println("# twai start failed");
+    return;
+  }
+  Serial.println(TEST_LOOPBACK ? "# ready (loopback test mode)" : "# ready (listen only)");
+}
+
+void loop() {
+#if TEST_LOOPBACK
+  generateTestFrames();
+#endif
+
+  uint32_t now = millis();
+  if (now - lastStat >= 1000) {
+    lastStat = now;
+    twai_status_info_t s;
+    if (twai_get_status_info(&s) == ESP_OK) {
+      if (s.state == TWAI_STATE_BUS_OFF) twai_initiate_recovery();
+      else if (s.state == TWAI_STATE_STOPPED) twai_start();
+      Serial.printf("# stat,%lu,%lu,%lu,%lu,%d,%lu\n", (unsigned long)frames,
+                    (unsigned long)s.rx_missed_count, (unsigned long)s.msgs_to_rx,
+                    (unsigned long)s.bus_error_count, (int)s.state,
+                    (unsigned long)usbDropped);
+    }
+  }
+
+  twai_message_t m;
+  if (twai_receive(&m, pdMS_TO_TICKS(1)) != ESP_OK) return;
+  do {
+    emit(m);
+  } while (twai_receive(&m, 0) == ESP_OK);
+  flushOut();   // one USB write per batch instead of one per frame
+}
