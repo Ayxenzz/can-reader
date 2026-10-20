@@ -7,9 +7,11 @@
 <style>
   :root { color-scheme: light dark; font: 14px system-ui, sans-serif; }
   body { margin: 0; padding: 12px; }
-  button { padding: 10px 18px; font-size: 15px; }
-  #warn { margin-top: 10px; font: bold 13px ui-monospace, monospace; color: #e5484d; white-space: pre-wrap; }
-  #info { margin: 10px 0; font: 12px ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; }
+  button { padding: 10px 16px; font-size: 15px; margin: 0 6px 6px 0; }
+  #warn { margin-top: 8px; font: bold 13px ui-monospace, monospace; color: #e5484d; white-space: pre-wrap; }
+  pre { margin: 8px 0; font: 12px ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; }
+  details { margin: 6px 0; }
+  summary { padding: 6px 0; font-size: 15px; }
   .wrap { overflow-x: auto; }
   table { border-collapse: collapse; font: 13px ui-monospace, monospace; width: 100%; }
   th, td { padding: 3px 6px; text-align: left; border-bottom: 1px solid #8884; white-space: nowrap; }
@@ -21,7 +23,17 @@
 <body>
 <button id="btn">Connect</button>
 <div id="warn"></div>
-<div id="info">Not connected.</div>
+<pre id="info">Not connected.</pre>
+<details id="logbox">
+  <summary>Event log</summary>
+  <button id="copy">Copy log</button><button id="clear">Clear</button>
+  <pre id="log"></pre>
+</details>
+<details>
+  <summary>Tests</summary>
+  <button id="runT">Run tests</button><button id="pingB">Ping board</button><button id="fileB">Save file test</button>
+  <pre id="tests"></pre>
+</details>
 <div class="wrap">
   <table>
     <thead><tr><th>ID</th><th>Count</th><th>ms</th><th>Data</th></tr></thead>
@@ -30,28 +42,67 @@
 </div>
 
 <script>
-const btn = document.getElementById('btn');
-const info = document.getElementById('info');
-const warn = document.getElementById('warn');
-const body = document.getElementById('body');
-
+const $ = (id) => document.getElementById(id);
+const btn = $('btn'), info = $('info'), warn = $('warn'), body = $('body');
+const logEl = $('log'), logBox = $('logbox'), testEl = $('tests');
 const H = Array.from({ length: 256 }, (_, i) => i.toString(16).toUpperCase().padStart(2, '0'));
 
-const rows = new Map();
-const dirty = new Set();
-const hot = new Map();   // span -> time its highlight may end
+const rows = new Map(), dirty = new Set(), hot = new Map(), prevs = {};
 let needSort = false;
 let total = 0, lastTotal = 0, bad = 0, bytes = 0, lastBytes = 0;
 let fMark = null, totalMark = 0, lost = 0, lostAcc = 0;
 let t0 = null, endT = null, lastT = 0, minFps = Infinity;
-let lastByteT = 0, lastFrameT = 0;
+let lastByteT = 0, lastFrameT = 0, noData = false, noFrames = false;
 let st = {}, lastUp = -1, reboots = 0, dev = '';
-let badData = 0, seqGaps = 0, testMode = false;
-let badLines = [];
+let badData = 0, seqGaps = 0, testMode = false, badLines = [];
 let paintMax = 0, paintRunMax = 0, lagMs = 0, lagRunMax = 0;
-let status = 'Not connected.';
-let port = null, reader = null;
+let idsEarly = 0, earlyDone = false, pingAt = 0;
+let status = 'Not connected.', port = null, reader = null, busy = false, wake = null;
 
+// ---- event log, kept across page reloads ----
+let logArr = [], logDirty = false;
+try { logArr = JSON.parse(localStorage.getItem('canreader.log') || '[]'); } catch (e) {}
+function ev(m) {
+  logArr.push(new Date().toTimeString().slice(0, 8) + '  ' + m);
+  if (logArr.length > 300) logArr.shift();
+  logDirty = true;
+}
+ev('--- page loaded ---');
+let boot = { first: Date.now(), loads: 1 };
+try {
+  const p = JSON.parse(localStorage.getItem('canreader.boot') || 'null');
+  if (p) boot = { first: p.first, loads: p.loads + 1 };
+  localStorage.setItem('canreader.boot', JSON.stringify(boot));
+} catch (e) {}
+setInterval(() => {
+  if (!logDirty) return;
+  try { localStorage.setItem('canreader.log', JSON.stringify(logArr.slice(-200))); } catch (e) {}
+  logDirty = false;
+}, 3000);
+$('copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(logArr.join('\n')); ev('log copied'); }
+  catch (e) { logEl.textContent = logArr.join('\n'); ev('copy failed, showing full log'); }
+};
+$('clear').onclick = () => { logArr = []; logDirty = true; logEl.textContent = ''; };
+window.addEventListener('error', (e) => ev('js error ' + e.message));
+window.addEventListener('unhandledrejection', (e) => ev('js rejection ' + (e.reason && e.reason.message || e.reason)));
+document.addEventListener('visibilitychange', () => {
+  ev(document.hidden ? 'page hidden' : 'page visible');
+  if (!document.hidden && reader) getWake();
+});
+document.addEventListener('freeze', () => ev('page frozen by browser'));
+document.addEventListener('resume', () => ev('page resumed'));
+
+async function getWake() {
+  if (!('wakeLock' in navigator) || wake) return;
+  try {
+    wake = await navigator.wakeLock.request('screen');
+    ev('wake lock on');
+    wake.addEventListener('release', () => { wake = null; ev('wake lock released'); });
+  } catch (e) { ev('wake lock failed ' + (e.name || e)); }
+}
+
+// ---- parsing ----
 // Must match generateTestFrames() in the firmware.
 function checkTest(r, b) {
   let ok, round;
@@ -80,6 +131,7 @@ function onStat(s) {
   if (!isNaN(up)) {
     if (lastUp >= 0 && up < lastUp) {   // device restarted without the USB link dropping
       reboots++;
+      ev('device restarted, reset ' + o.rst);
       lostAcc += lost; fMark = null; lost = 0;
       for (const r of rows.values()) r.round = undefined;
     }
@@ -87,17 +139,26 @@ function onStat(s) {
   }
   if (!isNaN(f)) {
     if (fMark === null) { fMark = f; totalMark = total; lost = 0; }
-    else lost = (f - fMark) - (total - totalMark);   // sent since mark minus counted since mark
+    else lost = (f - fMark) - (total - totalMark);
   }
-  testMode = o.mode === 'loopback';
+  const prev = st;
   st = o;
+  if (prev.up === undefined) ev('device ' + o.mode + ' ' + o.rate + ' reset ' + o.rst);
+  else for (const k of ['state', 'rate', 'buserr', 'missed', 'recov', 'usbdrop']) {
+    if (prev[k] !== o[k]) ev('dev ' + k + ' ' + prev[k] + ' to ' + o[k]);
+  }
+  if (Number(o.maxgap) > 50000) ev('dev loop gap ' + (o.maxgap / 1000).toFixed(0) + ' ms');
+  testMode = o.mode === 'loopback';
 }
 
 function onLine(s) {
   s = s.trim();
   if (!s) return;
   if (s[0] === '#') {
-    if (s.startsWith('# stat ')) onStat(s); else dev = s;
+    if (s.startsWith('# stat ')) onStat(s);
+    else if (s.startsWith('# pong')) {
+      if (pingAt) { tline('PASS ping board  ' + (performance.now() - pingAt).toFixed(0) + ' ms  ' + s); ev('ping ok'); pingAt = 0; }
+    } else dev = s;
     return;
   }
   const p = s.split(',');
@@ -115,6 +176,8 @@ function onLine(s) {
     r = { id, ext, count: 0, ts: 0, period: 0, dlc: 0, bytes: [], chg: [], tr: null, c: null };
     rows.set(key, r);
     needSort = true;
+    if (performance.now() - t0 < 5000) idsEarly++;
+    else ev('new id ' + p[1]);
   }
   r.count++;
   if (r.ts) r.period = (ts - r.ts) / 1000;
@@ -132,6 +195,7 @@ function onLine(s) {
   lastFrameT = performance.now();
 }
 
+// ---- drawing ----
 function makeRow(r) {
   const tr = document.createElement('tr');
   const mk = (txt, cls) => { const td = document.createElement('td'); if (cls) td.className = cls; td.textContent = txt; tr.appendChild(td); return td; };
@@ -156,7 +220,7 @@ function paint() {
   if (needSort) {
     for (const r of rows.values()) if (!r.tr) makeRow(r);
     const all = [...rows.values()].sort((x, y) => x.ext - y.ext || x.id - y.id);
-    for (const r of all) body.appendChild(r.tr);   // re-appending moves the node
+    for (const r of all) body.appendChild(r.tr);
     needSort = false;
   }
   for (const r of dirty) {
@@ -169,7 +233,7 @@ function paint() {
       if (r.chg[i]) {
         r.chg[i] = false;
         if (!sp.classList.contains('hot')) sp.classList.add('hot');
-        hot.set(sp, a + 150);   // hold the highlight briefly, then let the CSS transition fade it
+        hot.set(sp, a + 150);
       }
     }
   }
@@ -183,10 +247,17 @@ function paint() {
   requestAnimationFrame(paint);
 }
 
+// ---- once-per-second stats and event detection ----
 const mmss = (sec) => String(Math.floor(sec / 60)).padStart(2, '0') + ':' + String(Math.floor(sec % 60)).padStart(2, '0');
 const kb = (v) => v === undefined ? '-' : (Number(v) / 1024).toFixed(0) + 'k';
+function delta(k, cur, label) {
+  const p = prevs[k];
+  prevs[k] = cur;
+  if (p !== undefined && cur > p) ev(label + ' +' + (cur - p));
+}
 
 setInterval(() => {
+  if (logBox.open) logEl.textContent = logArr.slice(-15).join('\n');
   if (t0 === null) { info.textContent = status; return; }
   const t = performance.now();
   const live = endT === null;
@@ -203,6 +274,20 @@ setInterval(() => {
   const sent = total + lostAll;
   const pct = fMark !== null && sent > 0 ? (lostAll / sent * 100).toFixed(3) : '-';
 
+  if (live) {
+    if (lagMs > 300) ev('stall ' + lagMs.toFixed(0) + ' ms' + (document.hidden ? ' (page hidden)' : ''));
+    const gb = t - lastByteT, gf = t - lastFrameT;
+    if (gb > 3000 && !noData) { noData = true; ev('no usb data for 3 s'); }
+    if (gb < 3000 && noData) { noData = false; ev('usb data resumed'); }
+    if (gf > 3000 && gb < 3000 && !noFrames) { noFrames = true; ev('no frames for 3 s (bus quiet or wrong bitrate)'); }
+    if (gf < 3000 && noFrames) { noFrames = false; ev('frames resumed'); }
+    if (!earlyDone && el > 5) { earlyDone = true; ev(idsEarly + ' ids seen in first 5 s'); }
+    delta('lost', lostAll, 'lost');
+    delta('bad', bad, 'malformed' + (badLines.length ? ' e.g. ' + badLines[badLines.length - 1] : ''));
+    delta('wrong', badData, 'wrong data');
+    delta('gaps', seqGaps, 'seq gaps');
+  }
+
   const L = [];
   L.push(status + '   run ' + mmss(el));
   L.push('frames/s now ' + (live ? fps.toFixed(0) : '-') + ' avg ' + (total / el).toFixed(0) +
@@ -216,29 +301,40 @@ setInterval(() => {
     L.push('tec ' + st.tec + ' rec ' + st.rec + ' buserr ' + st.buserr);
     L.push('missed ' + st.missed + ' peakq ' + st.peakq + ' recov ' + st.recov);
     L.push('usbdrop ' + st.usbdrop + ' heap ' + kb(st.heap) + ' min ' + kb(st.minheap));
+    L.push('loop gap max ' + (st.maxgap / 1000).toFixed(1) + 'ms  cmdrx ' + st.cmdrx);
     L.push('reset ' + st.rst + '  reboots seen ' + reboots);
   }
   L.push('paint ' + paintMax.toFixed(1) + 'ms (run max ' + paintRunMax.toFixed(1) + ')');
   L.push('tick lag ' + lagMs.toFixed(0) + 'ms (run max ' + lagRunMax.toFixed(0) + ')');
+  L.push('wake lock ' + (wake ? 'on' : 'off') +
+         (performance.memory ? '  js heap ' + (performance.memory.usedJSHeapSize / 1048576).toFixed(0) + 'M' : ''));
   if (badLines.length) L.push('bad lines ' + badLines.join(' | '));
   if (dev) L.push(dev);
   info.textContent = L.join('\n');
   paintMax = 0;
 
   const w = [];
-  if (live && t - lastByteT > 3000) w.push('NO USB DATA for ' + ((t - lastByteT) / 1000).toFixed(0) + ' s');
-  else if (live && t - lastFrameT > 3000) w.push('No frames for ' + ((t - lastFrameT) / 1000).toFixed(0) + ' s. Bus quiet or wrong bitrate.');
+  if (live && noData) w.push('NO USB DATA');
+  else if (live && noFrames) w.push('No frames. Bus quiet or wrong bitrate.');
   if (reboots) w.push('Device restarted ' + reboots + 'x');
   if (testMode && (badData || seqGaps)) w.push('Test data errors');
   warn.textContent = w.join('\n');
 }, 1000);
 
-async function connect() {
+// ---- connection ----
+async function connect(p) {
+  if (busy) return;
   if (!('serial' in navigator)) { status = 'Web Serial is not available in this browser.'; return; }
+  busy = true;
   try {
-    port = await navigator.serial.requestPort();
+    port = p || await navigator.serial.requestPort();
     await port.open({ baudRate: 2000000, bufferSize: 65536 });
-  } catch (e) { status = 'Could not open port. ' + e.message; return; }
+  } catch (e) {
+    status = 'Could not open port. ' + e.message;
+    ev('open failed ' + e.message);
+    port = null; busy = false;
+    return;
+  }
 
   // fresh run, reset everything
   rows.clear(); dirty.clear(); hot.clear(); body.innerHTML = '';
@@ -247,13 +343,20 @@ async function connect() {
   st = {}; lastUp = -1; reboots = 0; dev = '';
   badData = 0; seqGaps = 0; testMode = false; badLines = [];
   paintMax = 0; paintRunMax = 0; lagMs = 0; lagRunMax = 0;
+  for (const k in prevs) delete prevs[k];
+  noData = noFrames = false; idsEarly = 0; earlyDone = false;
   t0 = performance.now(); lastT = t0; endT = null; minFps = Infinity;
   lastByteT = t0; lastFrameT = t0;
 
+  let usb = '';
+  try { const i = port.getInfo(); usb = ' vid ' + (i.usbVendorId || 0).toString(16) + ' pid ' + (i.usbProductId || 0).toString(16); } catch (e) {}
+  ev('connected' + (p ? ' (auto)' : '') + usb);
   status = 'Connected.';
   btn.textContent = 'Disconnect';
+  getWake();
+
   const dec = new TextDecoder();
-  let buf = '', first = true;
+  let buf = '', first = true, why = 'closed';
   reader = port.readable.getReader();
   try {
     for (;;) {
@@ -272,17 +375,126 @@ async function connect() {
       if (buf.length > 1000) buf = '';
     }
   } catch (e) {
+    why = e.message;
     status = 'Read error. ' + e.message;
   } finally {
     endT = performance.now();
     try { reader.releaseLock(); await port.close(); } catch (e) {}
-    reader = null; port = null;
+    reader = null; port = null; busy = false;
     btn.textContent = 'Connect';
     if (status === 'Connected.') status = 'Disconnected.';
+    ev('disconnected ' + why);
+    if (wake) wake.release();
   }
 }
 
+async function tryAuto() {
+  if (busy || !('serial' in navigator)) return;
+  try {
+    const ps = await navigator.serial.getPorts();
+    ev('auto-connect, granted ports ' + ps.length);
+    if (ps.length) await connect(ps[0]);
+  } catch (e) { ev('auto-connect failed ' + (e.message || e)); }
+}
+if ('serial' in navigator) {
+  navigator.serial.addEventListener('connect', () => { ev('usb device attached'); tryAuto(); });
+  navigator.serial.addEventListener('disconnect', () => ev('usb device detached'));
+  tryAuto();
+}
 btn.onclick = () => { if (reader) reader.cancel(); else connect(); };
+
+// ---- tests ----
+const tline = (s) => { testEl.textContent += s + '\n'; };
+const ago = (t) => { const s = (Date.now() - t) / 1000; return s < 90 ? s.toFixed(0) + 's' : s < 5400 ? (s / 60).toFixed(0) + 'm' : (s / 3600).toFixed(1) + 'h'; };
+
+function idbTest() {
+  return new Promise((res, rej) => {
+    const q = indexedDB.open('canreader', 1);
+    q.onupgradeneeded = () => q.result.createObjectStore('k');
+    q.onerror = () => rej(q.error);
+    q.onsuccess = () => {
+      const db = q.result, tx = db.transaction('k', 'readwrite'), s = tx.objectStore('k'), g = s.get('t');
+      g.onsuccess = () => {
+        const prev = g.result;
+        s.put(Date.now(), 't');
+        tx.oncomplete = () => { db.close(); res(prev ? 'previous write ' + ago(prev) + ' ago' : 'first write'); };
+      };
+      tx.onerror = () => rej(tx.error);
+    };
+  });
+}
+
+function workerTest() {
+  return new Promise((res) => {
+    try {
+      const w = new Worker(URL.createObjectURL(new Blob(['onmessage=e=>postMessage(e.data+1)'])));
+      const t = setTimeout(() => { w.terminate(); res(false); }, 1500);
+      w.onmessage = (e) => { clearTimeout(t); w.terminate(); res(e.data === 2); };
+      w.onerror = () => { clearTimeout(t); res(false); };
+      w.postMessage(1);
+    } catch (e) { res(false); }
+  });
+}
+
+$('runT').onclick = async () => {
+  testEl.textContent = '';
+  const T = (n, ok, d) => tline((ok === null ? 'INFO ' : ok ? 'PASS ' : 'FAIL ') + n + (d !== undefined ? '  ' + d : ''));
+  T('secure context', window.isSecureContext, location.origin);
+  T('web serial', 'serial' in navigator);
+  try { T('granted ports', null, String((await navigator.serial.getPorts()).length)); } catch (e) { T('getPorts', false, e.message); }
+  if (port) {
+    try { const i = port.getInfo(); T('port info', null, 'vid ' + (i.usbVendorId || 0).toString(16) + ' pid ' + (i.usbProductId || 0).toString(16)); } catch (e) { T('port info', false, e.message); }
+    T('setSignals', typeof port.setSignals === 'function');
+    T('port.writable', !!port.writable);
+  } else T('port tests', null, 'connect first');
+  try {
+    localStorage.setItem('canreader.t', '1');
+    T('localStorage', localStorage.getItem('canreader.t') === '1', 'loads ' + boot.loads + ', first ' + ago(boot.first) + ' ago');
+  } catch (e) { T('localStorage', false, e.message); }
+  try { T('indexedDB', true, await idbTest()); } catch (e) { T('indexedDB', false, String(e)); }
+  T('file picker api', 'showSaveFilePicker' in window);
+  try { await navigator.clipboard.writeText('can-reader test'); T('clipboard write', true); } catch (e) { T('clipboard write', false, e.name); }
+  T('wake lock api', 'wakeLock' in navigator, wake ? 'held' : 'not held');
+  T('web worker', await workerTest());
+  T('bigint', typeof BigInt === 'function');
+  T('js heap api', !!performance.memory);
+  tline('Next. Press Ping board and Save file test. Then close the app, reopen, and run again. loads should go up and indexedDB should report a previous write.');
+};
+
+$('pingB').onclick = async () => {
+  if (!port) { tline('FAIL ping board  not connected'); return; }
+  try {
+    const w = port.writable.getWriter();
+    await w.write(new TextEncoder().encode('ping\n'));
+    w.releaseLock();
+    pingAt = performance.now();
+    setTimeout(() => { if (pingAt) { tline('FAIL ping board  no pong in 2 s'); ev('ping failed'); pingAt = 0; } }, 2000);
+  } catch (e) { tline('FAIL ping board  write failed ' + e.message); ev('ping write failed ' + e.message); }
+};
+
+$('fileB').onclick = async () => {
+  const txt = 'can-reader file test ' + new Date().toISOString() + '\n';
+  if ('showSaveFilePicker' in window) {
+    try {
+      const h = await showSaveFilePicker({ suggestedName: 'can-test.txt' });
+      const w = await h.createWritable();
+      await w.write(txt);
+      await w.close();
+      tline('PASS file picker write');
+      ev('file picker write ok');
+      return;
+    } catch (e) { tline('FAIL file picker  ' + e.name); }
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([txt]));
+  a.download = 'can-test.txt';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  tline('INFO download triggered. Check your Downloads for can-test.txt.');
+  ev('download fallback triggered');
+};
+
 requestAnimationFrame(paint);
 </script>
 </body>
