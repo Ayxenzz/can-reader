@@ -15,12 +15,12 @@
 #include "esp_timer.h"
 #include "esp_system.h"
 
-#define TEST_LOOPBACK 1
+#define TEST_LOOPBACK 0
 #define TEST_FPS 3000
 #define TEST_IDS 40
 
-#define CAN_TX_PIN 5
-#define CAN_RX_PIN 4
+#define CAN_TX_PIN 4
+#define CAN_RX_PIN 5
 
 #define RATE_COUNT 4
 static const char *RATE_NAMES[RATE_COUNT] = {"500k", "250k", "125k", "1M"};
