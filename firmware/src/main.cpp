@@ -1,7 +1,8 @@
 // ESP32 CAN reader. Frame lines are ts_us,id_hex,ext,dlc,data_hex. Lines starting with # are status.
 // Env "car"      listen-only, scans bitrates, never transmits.
+// Env "scanner"  same as car, plus a "dtc" command that reads trouble codes (it transmits briefly).
 // Env "loopback" transmits test frames, needs GPIO 4 jumpered to GPIO 5. NEVER use on a car.
-// The page can send "ping" and gets "# pong".
+// Commands from the page: "ping" and "dtc".
 
 #include <Arduino.h>
 #include <string.h>
@@ -11,6 +12,9 @@
 
 #ifndef TEST_LOOPBACK
 #define TEST_LOOPBACK 0   // safe default
+#endif
+#ifndef SCANNER
+#define SCANNER 0
 #endif
 #define TEST_FPS 3000
 #define TEST_IDS 40
@@ -119,6 +123,12 @@ const char *stateName(int s) {
   }
 }
 
+const char *modeName() {
+  if (TEST_LOOPBACK) return "loopback";
+  if (SCANNER) return "scanner";
+  return "listen";
+}
+
 void printStat() {
   twai_status_info_t s;
   if (twai_get_status_info(&s) != ESP_OK) return;
@@ -129,7 +139,7 @@ void printStat() {
                 "buserr=%lu missed=%lu rxq=%lu peakq=%lu recov=%lu usbdrop=%lu "
                 "heap=%lu minheap=%lu maxgap=%lu cmdrx=%lu rst=%s\n",
                 (unsigned long)(millis() / 1000), (unsigned long)frames,
-                TEST_LOOPBACK ? "loopback" : "listen", RATE_NAMES[rateIdx],
+                modeName(), RATE_NAMES[rateIdx],
                 stateName(s.state), (unsigned long)s.tx_error_counter,
                 (unsigned long)s.rx_error_counter, (unsigned long)s.bus_error_count,
                 (unsigned long)s.rx_missed_count, (unsigned long)s.msgs_to_rx,
@@ -139,20 +149,6 @@ void printStat() {
                 (unsigned long)cmdBytes, resetName());
   peakBatch = 0;
   maxGap = 0;
-}
-
-void pollCommands() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    cmdBytes++;
-    if (c == '\n' || c == '\r') {
-      cmd[cmdN] = 0;
-      if (cmdN && !strcmp(cmd, "ping")) Serial.printf("# pong rx=%lu\n", (unsigned long)cmdBytes);
-      cmdN = 0;
-    } else if (cmdN < (int)sizeof(cmd) - 1) {
-      cmd[cmdN++] = c;
-    }
-  }
 }
 
 void flushOut() {
@@ -176,6 +172,153 @@ void emit(const twai_message_t &m) {
   p[n++] = '\n';
   outN += n;
   frames++;
+}
+
+#if SCANNER
+// ---- trouble code reading (OBD-II services 03, 07, 0A over CAN, ISO 15765-4) ----
+struct Ecu {
+  bool used, done;
+  uint16_t total, got;
+  uint8_t seq;
+  uint8_t buf[128];
+};
+static Ecu ecus[8];
+static uint32_t lastScanMs = 0;
+
+static void sendFrame(uint32_t id, const uint8_t *d) {
+  twai_message_t t = {};
+  t.identifier = id;
+  t.data_length_code = 8;
+  memcpy(t.data, d, 8);
+  twai_transmit(&t, pdMS_TO_TICKS(50));
+}
+
+static void scanFrame(const twai_message_t &m) {
+  if (m.extd || m.identifier < 0x7E8 || m.identifier > 0x7EF || m.data_length_code < 2) return;
+  Ecu &e = ecus[m.identifier - 0x7E8];
+  uint8_t pci = m.data[0] & 0xF0;
+  if (pci == 0x00) {                         // single frame
+    uint8_t n = m.data[0] & 0x0F;
+    if (n < 1 || n > 7) return;
+    e.used = true;
+    e.total = n;
+    e.got = n;
+    memcpy(e.buf, m.data + 1, n);
+    e.done = true;
+  } else if (pci == 0x10) {                  // first frame of a longer message
+    uint16_t total = ((m.data[0] & 0x0F) << 8) | m.data[1];
+    if (total > sizeof(e.buf)) total = sizeof(e.buf);
+    e.used = true;
+    e.done = false;
+    e.total = total;
+    e.seq = 1;
+    e.got = total < 6 ? total : 6;
+    memcpy(e.buf, m.data + 2, e.got);
+    if (e.got >= e.total) e.done = true;
+    else {
+      uint8_t fc[8] = {0x30, 0x00, 0x00, 0, 0, 0, 0, 0};   // flow control, send the rest
+      sendFrame(m.identifier - 8, fc);
+    }
+  } else if (pci == 0x20 && e.used && !e.done) {   // consecutive frame
+    if ((m.data[0] & 0x0F) != (e.seq & 0x0F)) return;
+    e.seq++;
+    uint16_t n = e.total - e.got;
+    if (n > 7) n = 7;
+    memcpy(e.buf + e.got, m.data + 1, n);
+    e.got += n;
+    if (e.got >= e.total) e.done = true;
+  }
+}
+
+static int reportEcus(uint8_t mode) {
+  int answered = 0;
+  for (int i = 0; i < 8; i++) {
+    Ecu &e = ecus[i];
+    if (!e.used) continue;
+    answered++;
+    unsigned long id = 0x7E8 + i;
+    if (!e.done || e.got == 0) { Serial.printf("# dtc mode=%02X ecu=%lX incomplete\n", mode, id); continue; }
+    if (e.buf[0] == 0x7F) { Serial.printf("# dtc mode=%02X ecu=%lX refused nrc=%02X\n", mode, id, e.got > 2 ? e.buf[2] : 0); continue; }
+    if (e.buf[0] != (uint8_t)(mode + 0x40)) { Serial.printf("# dtc mode=%02X ecu=%lX unexpected=%02X\n", mode, id, e.buf[0]); continue; }
+    const uint8_t *b = e.buf + 1;
+    int len = e.got - 1;
+    if (len & 1) { b++; len--; }             // odd length means a leading count byte
+    char codes[160];
+    codes[0] = 0;
+    int c = 0, n = 0;
+    for (int k = 0; k + 1 < len && c < (int)sizeof(codes) - 8; k += 2) {
+      uint8_t hi = b[k], lo = b[k + 1];
+      if (!hi && !lo) continue;
+      c += snprintf(codes + c, sizeof(codes) - c, " %c%d%X%02X", "PCBU"[hi >> 6], (hi >> 4) & 3, hi & 15, lo);
+      n++;
+    }
+    if (n) Serial.printf("# dtc mode=%02X ecu=%lX n=%d%s\n", mode, id, n, codes);
+    else Serial.printf("# dtc mode=%02X ecu=%lX none\n", mode, id);
+  }
+  return answered;
+}
+
+static void scanMode(uint8_t mode) {
+  memset(ecus, 0, sizeof(ecus));
+  uint8_t req[8] = {0x01, mode, 0, 0, 0, 0, 0, 0};
+  sendFrame(0x7DF, req);                     // broadcast request to all ECUs
+  int64_t end = esp_timer_get_time() + 1500000;
+  twai_message_t m;
+  while (esp_timer_get_time() < end) {
+    if (twai_receive(&m, pdMS_TO_TICKS(5)) != ESP_OK) continue;
+    scanFrame(m);
+    emit(m);                                 // keep streaming frames to the page meanwhile
+    if (outN > 1500) flushOut();
+  }
+  flushOut();
+  if (!reportEcus(mode)) Serial.printf("# dtc mode=%02X no response\n", mode);
+}
+
+static void runScan() {
+  if (millis() - lastFrameMs > 1000) { Serial.println("# dtc refused, no bus traffic"); return; }
+  if (lastScanMs && millis() - lastScanMs < 3000) { Serial.println("# dtc refused, too soon"); return; }
+  lastScanMs = millis();
+  flushOut();
+  Serial.printf("# dtc start rate=%s\n", RATE_NAMES[rateIdx]);
+  canStop();
+  if (!canStart(rateIdx, TWAI_MODE_NORMAL)) {
+    Serial.println("# dtc cannot start normal mode");
+    canStart(rateIdx, TWAI_MODE_LISTEN_ONLY);
+    return;
+  }
+  scanMode(0x03);   // stored
+  scanMode(0x07);   // pending
+  scanMode(0x0A);   // permanent
+  canStop();
+  if (!canStart(rateIdx, TWAI_MODE_LISTEN_ONLY)) Serial.println("# twai restart failed");
+  lastFrameMs = millis();
+  lastLoopU = micros();
+  maxGap = 0;
+  Serial.println("# dtc done");
+}
+#endif
+
+void pollCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    cmdBytes++;
+    if (c == '\n' || c == '\r') {
+      cmd[cmdN] = 0;
+      if (cmdN) {
+        if (!strcmp(cmd, "ping")) Serial.printf("# pong rx=%lu\n", (unsigned long)cmdBytes);
+        else if (!strcmp(cmd, "dtc")) {
+#if SCANNER
+          runScan();
+#else
+          Serial.println("# dtc unsupported, flash the scanner build");
+#endif
+        }
+      }
+      cmdN = 0;
+    } else if (cmdN < (int)sizeof(cmd) - 1) {
+      cmd[cmdN++] = c;
+    }
+  }
 }
 
 #if TEST_LOOPBACK
@@ -232,7 +375,7 @@ void setup() {
   if (!canStart(rateIdx, TWAI_MODE_LISTEN_ONLY)) Serial.println("# twai start failed");
   lastFrameMs = millis();
 #endif
-  Serial.printf("# boot reset=%s rate=%s\n", resetName(), RATE_NAMES[rateIdx]);
+  Serial.printf("# boot reset=%s rate=%s mode=%s\n", resetName(), RATE_NAMES[rateIdx], modeName());
   lastLoopU = micros();
 }
 
