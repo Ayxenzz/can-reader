@@ -19,12 +19,12 @@ jobs:
           path: ~/.platformio
           key: pio-${{ hashFiles('firmware/platformio.ini') }}
       - run: pip install platformio
-      - run: pio run -e car -e loopback
+      - run: pio run -e car -e scanner -e loopback
         working-directory: firmware
       - name: Merge images
         working-directory: firmware
         run: |
-          for e in car loopback; do
+          for e in car scanner loopback; do
             python ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32s3 merge_bin \
               -o merged-$e.bin --flash_mode qio --flash_freq 80m --flash_size 16MB \
               0x0 .pio/build/$e/bootloader.bin \
