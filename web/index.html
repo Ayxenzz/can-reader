@@ -30,6 +30,11 @@
   <pre id="log"></pre>
 </details>
 <details>
+  <summary>Trouble codes</summary>
+  <button id="dtcB">Read codes</button>
+  <pre id="diag">Needs the scanner firmware. Ignition on, engine off.</pre>
+</details>
+<details>
   <summary>Tests</summary>
   <button id="runT">Run tests</button><button id="pingB">Ping board</button><button id="fileB">Save file test</button>
   <pre id="tests"></pre>
@@ -44,7 +49,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const btn = $('btn'), info = $('info'), warn = $('warn'), body = $('body');
-const logEl = $('log'), logBox = $('logbox'), testEl = $('tests');
+const logEl = $('log'), logBox = $('logbox'), testEl = $('tests'), diagEl = $('diag');
 const H = Array.from({ length: 256 }, (_, i) => i.toString(16).toUpperCase().padStart(2, '0'));
 
 const rows = new Map(), dirty = new Set(), hot = new Map(), prevs = {};
@@ -56,7 +61,7 @@ let lastByteT = 0, lastFrameT = 0, noData = false, noFrames = false;
 let st = {}, lastUp = -1, reboots = 0, dev = '';
 let badData = 0, seqGaps = 0, testMode = false, badLines = [];
 let paintMax = 0, paintRunMax = 0, lagMs = 0, lagRunMax = 0;
-let idsEarly = 0, earlyDone = false, pingAt = 0;
+let idsEarly = 0, earlyDone = false, pingAt = 0, diagAt = 0;
 let status = 'Not connected.', port = null, reader = null, busy = false, wake = null;
 
 // ---- event log, kept across page reloads ----
@@ -151,11 +156,24 @@ function onStat(s) {
   testMode = o.mode === 'loopback';
 }
 
+function onDtc(s) {
+  diagAt = 0;
+  let t = s.slice(6);
+  t = t.replace('mode=03', 'stored').replace('mode=07', 'pending').replace('mode=0A', 'permanent');
+  if (t.startsWith('start')) diagEl.textContent = '';
+  diagEl.textContent += t + '\n';
+  ev('dtc ' + t);
+  if (t.startsWith('done') && /\sU\d/.test(diagEl.textContent)) {
+    diagEl.textContent += 'U codes are network faults.\n';
+  }
+}
+
 function onLine(s) {
   s = s.trim();
   if (!s) return;
   if (s[0] === '#') {
     if (s.startsWith('# stat ')) onStat(s);
+    else if (s.startsWith('# dtc')) onDtc(s);
     else if (s.startsWith('# pong')) {
       if (pingAt) { tline('PASS ping board  ' + (performance.now() - pingAt).toFixed(0) + ' ms  ' + s); ev('ping ok'); pingAt = 0; }
     } else dev = s;
@@ -403,6 +421,23 @@ if ('serial' in navigator) {
 }
 btn.onclick = () => { if (reader) reader.cancel(); else connect(); };
 
+async function sendCmd(c) {
+  const w = port.writable.getWriter();
+  try { await w.write(new TextEncoder().encode(c + '\n')); } finally { w.releaseLock(); }
+}
+
+// ---- trouble codes ----
+$('dtcB').onclick = async () => {
+  if (!port) { diagEl.textContent = 'Connect first.\n'; return; }
+  diagEl.textContent = 'Reading, takes about 5 s...\n';
+  try {
+    await sendCmd('dtc');
+    diagAt = performance.now();
+    ev('read codes requested');
+    setTimeout(() => { if (diagAt) { diagEl.textContent += 'No reply from the board.\n'; diagAt = 0; } }, 15000);
+  } catch (e) { diagEl.textContent = 'Write failed. ' + e.message + '\n'; }
+};
+
 // ---- tests ----
 const tline = (s) => { testEl.textContent += s + '\n'; };
 const ago = (t) => { const s = (Date.now() - t) / 1000; return s < 90 ? s.toFixed(0) + 's' : s < 5400 ? (s / 60).toFixed(0) + 'm' : (s / 3600).toFixed(1) + 'h'; };
@@ -464,9 +499,7 @@ $('runT').onclick = async () => {
 $('pingB').onclick = async () => {
   if (!port) { tline('FAIL ping board  not connected'); return; }
   try {
-    const w = port.writable.getWriter();
-    await w.write(new TextEncoder().encode('ping\n'));
-    w.releaseLock();
+    await sendCmd('ping');
     pingAt = performance.now();
     setTimeout(() => { if (pingAt) { tline('FAIL ping board  no pong in 2 s'); ev('ping failed'); pingAt = 0; } }, 2000);
   } catch (e) { tline('FAIL ping board  write failed ' + e.message); ev('ping write failed ' + e.message); }
