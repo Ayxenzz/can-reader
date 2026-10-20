@@ -1,21 +1,19 @@
 // ESP32 CAN reader. Streams frames as text lines over USB serial.
-// Frame line  ts_us,id_hex,ext,dlc,data_hex
-// Status line # stat,frames,missed,rxqueue,buserrors,state,usbdropped   (once per second)
+// Frame line   ts_us,id_hex,ext,dlc,data_hex
+// Status line  # stat key=value key=value ...   (once per second)
+// Other lines  # text
 //
 // TEST_LOOPBACK 1 generates frames inside the chip. No transceiver or car needed,
-// but GPIO 4 (RX) must be jumpered to GPIO 5 (TX), or the controller sees its own
-// bits as errors and goes bus-off.
-// In that mode the chip transmits, so NEVER connect it to a car while it is on.
-// Set it to 0 for real reading (listen-only, nothing is ever transmitted),
-// and remove the jumper.
-//
-// TEST_FPS is the generated frame rate. At 500 kbit/s a full 8-byte frame takes about
-// 250 us on the wire, so the ceiling is roughly 4000. 2000 is about 50 percent bus load,
-// which is what a busy car looks like.
+// but GPIO 4 (RX) must be jumpered to GPIO 5 (TX). The chip transmits in that mode,
+// so NEVER connect it to a car while it is on.
+// TEST_LOOPBACK 0 is for the car. Listen-only, nothing is ever transmitted. It scans
+// 500k, 250k, 125k and 1M at boot and keeps the rate that produces frames. Remove
+// the jumper.
 
 #include <Arduino.h>
 #include "driver/twai.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 
 #define TEST_LOOPBACK 1
 #define TEST_FPS 3000
@@ -23,14 +21,123 @@
 
 #define CAN_TX_PIN 5
 #define CAN_RX_PIN 4
-#define TIMING_CONFIG TWAI_TIMING_CONFIG_500KBITS()
 
+#define RATE_COUNT 4
+static const char *RATE_NAMES[RATE_COUNT] = {"500k", "250k", "125k", "1M"};
+
+static int rateIdx = 0;
 static uint32_t frames = 0;
 static uint32_t usbDropped = 0;
+static uint32_t recoveries = 0;
+static uint32_t peakBatch = 0;
 static uint32_t lastStat = 0;
+static uint32_t lastFrameMs = 0;
 
 static char out[2048];
 static int outN = 0;
+
+twai_timing_config_t timingFor(int i) {
+  switch (i) {
+    case 1: { twai_timing_config_t t = TWAI_TIMING_CONFIG_250KBITS(); return t; }
+    case 2: { twai_timing_config_t t = TWAI_TIMING_CONFIG_125KBITS(); return t; }
+    case 3: { twai_timing_config_t t = TWAI_TIMING_CONFIG_1MBITS(); return t; }
+    default: { twai_timing_config_t t = TWAI_TIMING_CONFIG_500KBITS(); return t; }
+  }
+}
+
+bool canStart(int idx, twai_mode_t mode) {
+  twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(
+      (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, mode);
+  g.rx_queue_len = 256;
+  g.tx_queue_len = 32;
+  twai_timing_config_t t = timingFor(idx);
+  twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  if (twai_driver_install(&g, &t, &f) != ESP_OK) return false;
+  if (twai_start() != ESP_OK) { twai_driver_uninstall(); return false; }
+  return true;
+}
+
+void canStop() {
+  twai_stop();
+  twai_driver_uninstall();
+}
+
+// Listens for one second at each rate. Returns the best index, or -1 if nothing was heard.
+int autobaud() {
+  int best = -1;
+  int bestScore = 0;
+  for (int i = 0; i < RATE_COUNT; i++) {
+    if (!canStart(i, TWAI_MODE_LISTEN_ONLY)) continue;
+    uint32_t got = 0;
+    int64_t end = esp_timer_get_time() + 1000000;
+    twai_message_t m;
+    while (esp_timer_get_time() < end) {
+      if (twai_receive(&m, pdMS_TO_TICKS(5)) == ESP_OK) got++;
+    }
+    twai_status_info_t s;
+    twai_get_status_info(&s);
+    canStop();
+    int score = (int)got - 10 * (int)s.bus_error_count;
+    Serial.printf("# autobaud %s frames=%lu errors=%lu\n", RATE_NAMES[i],
+                  (unsigned long)got, (unsigned long)s.bus_error_count);
+    if (score > bestScore) { bestScore = score; best = i; }
+  }
+  return best;
+}
+
+void rescan() {
+  Serial.println("# bus silent, rescanning bitrates");
+  canStop();
+  int best = autobaud();
+  if (best >= 0) rateIdx = best;
+  if (!canStart(rateIdx, TWAI_MODE_LISTEN_ONLY)) Serial.println("# twai restart failed");
+  lastFrameMs = millis();
+}
+
+const char *resetName() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "poweron";
+    case ESP_RST_EXT: return "ext";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "int_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    default: return "other";
+  }
+}
+
+const char *stateName(int s) {
+  switch (s) {
+    case TWAI_STATE_STOPPED: return "STOPPED";
+    case TWAI_STATE_RUNNING: return "RUNNING";
+    case TWAI_STATE_BUS_OFF: return "BUS_OFF";
+    case TWAI_STATE_RECOVERING: return "RECOVERING";
+    default: return "?";
+  }
+}
+
+void printStat() {
+  twai_status_info_t s;
+  if (twai_get_status_info(&s) != ESP_OK) return;
+  if (s.state == TWAI_STATE_BUS_OFF) { twai_initiate_recovery(); recoveries++; }
+  else if (s.state == TWAI_STATE_STOPPED) twai_start();
+
+  Serial.printf("# stat up=%lu frames=%lu mode=%s rate=%s state=%s tec=%lu rec=%lu "
+                "buserr=%lu missed=%lu rxq=%lu peakq=%lu recov=%lu usbdrop=%lu "
+                "heap=%lu minheap=%lu rst=%s\n",
+                (unsigned long)(millis() / 1000), (unsigned long)frames,
+                TEST_LOOPBACK ? "loopback" : "listen", RATE_NAMES[rateIdx],
+                stateName(s.state), (unsigned long)s.tx_error_counter,
+                (unsigned long)s.rx_error_counter, (unsigned long)s.bus_error_count,
+                (unsigned long)s.rx_missed_count, (unsigned long)s.msgs_to_rx,
+                (unsigned long)peakBatch, (unsigned long)recoveries,
+                (unsigned long)usbDropped, (unsigned long)ESP.getFreeHeap(),
+                (unsigned long)ESP.getMinFreeHeap(), resetName());
+  peakBatch = 0;
+}
 
 void flushOut() {
   if (outN == 0) return;
@@ -59,6 +166,7 @@ void emit(const twai_message_t &m) {
 static int64_t nextTestUs = 0;
 static uint32_t testSeq = 0;
 
+// The web page checks these exact patterns. If you change them here, change checkTest() there.
 void generateTestFrames() {
   int64_t now = esp_timer_get_time();
   if (nextTestUs == 0) nextTestUs = now;
@@ -94,28 +202,21 @@ void generateTestFrames() {
 #endif
 
 void setup() {
-  Serial.setTxBufferSize(16384);   // must come before begin(); the default is tiny
+  Serial.setTxBufferSize(16384);   // must come before begin()
   Serial.begin(2000000);
-  Serial.setTxTimeoutMs(0);   // drop data rather than block when nothing is reading
+  Serial.setTxTimeoutMs(0);        // drop data rather than block when nothing is reading
 
 #if TEST_LOOPBACK
-  const twai_mode_t mode = TWAI_MODE_NO_ACK;
+  rateIdx = 0;
+  if (!canStart(rateIdx, TWAI_MODE_NO_ACK)) Serial.println("# twai start failed");
 #else
-  const twai_mode_t mode = TWAI_MODE_LISTEN_ONLY;
+  int best;
+  while ((best = autobaud()) < 0) Serial.println("# no bus traffic heard, retrying");
+  rateIdx = best;
+  if (!canStart(rateIdx, TWAI_MODE_LISTEN_ONLY)) Serial.println("# twai start failed");
+  lastFrameMs = millis();
 #endif
-
-  twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(
-      (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, mode);
-  g.rx_queue_len = 256;
-  g.tx_queue_len = 32;
-  twai_timing_config_t t = TIMING_CONFIG;
-  twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-
-  if (twai_driver_install(&g, &t, &f) != ESP_OK || twai_start() != ESP_OK) {
-    Serial.println("# twai start failed");
-    return;
-  }
-  Serial.println(TEST_LOOPBACK ? "# ready (loopback test mode)" : "# ready (listen only)");
+  Serial.printf("# boot reset=%s rate=%s\n", resetName(), RATE_NAMES[rateIdx]);
 }
 
 void loop() {
@@ -126,21 +227,20 @@ void loop() {
   uint32_t now = millis();
   if (now - lastStat >= 1000) {
     lastStat = now;
-    twai_status_info_t s;
-    if (twai_get_status_info(&s) == ESP_OK) {
-      if (s.state == TWAI_STATE_BUS_OFF) twai_initiate_recovery();
-      else if (s.state == TWAI_STATE_STOPPED) twai_start();
-      Serial.printf("# stat,%lu,%lu,%lu,%lu,%d,%lu\n", (unsigned long)frames,
-                    (unsigned long)s.rx_missed_count, (unsigned long)s.msgs_to_rx,
-                    (unsigned long)s.bus_error_count, (int)s.state,
-                    (unsigned long)usbDropped);
-    }
+    printStat();
   }
+#if !TEST_LOOPBACK
+  if (now - lastFrameMs > 10000) rescan();
+#endif
 
   twai_message_t m;
   if (twai_receive(&m, pdMS_TO_TICKS(1)) != ESP_OK) return;
+  uint32_t batch = 0;
   do {
     emit(m);
+    batch++;
   } while (twai_receive(&m, 0) == ESP_OK);
+  if (batch > peakBatch) peakBatch = batch;
+  lastFrameMs = millis();
   flushOut();   // one USB write per batch instead of one per frame
 }
