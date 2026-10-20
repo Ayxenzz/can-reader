@@ -1,26 +1,21 @@
-// ESP32 CAN reader. Streams frames as text lines over USB serial.
-// Frame line   ts_us,id_hex,ext,dlc,data_hex
-// Status line  # stat key=value key=value ...   (once per second)
-// Other lines  # text
-//
-// TEST_LOOPBACK 1 generates frames inside the chip. No transceiver or car needed,
-// but GPIO 4 (RX) must be jumpered to GPIO 5 (TX). The chip transmits in that mode,
-// so NEVER connect it to a car while it is on.
-// TEST_LOOPBACK 0 is for the car. Listen-only, nothing is ever transmitted. It scans
-// 500k, 250k, 125k and 1M at boot and keeps the rate that produces frames. Remove
-// the jumper.
+// ESP32 CAN reader. Frame lines are ts_us,id_hex,ext,dlc,data_hex. Lines starting with # are status.
+// Env "car"      listen-only, scans bitrates, never transmits.
+// Env "loopback" transmits test frames, needs GPIO 4 jumpered to GPIO 5. NEVER use on a car.
+// The page can send "ping" and gets "# pong".
 
 #include <Arduino.h>
+#include <string.h>
 #include "driver/twai.h"
 #include "esp_timer.h"
 #include "esp_system.h"
 
-#define TEST_LOOPBACK 0
+#ifndef TEST_LOOPBACK
+#define TEST_LOOPBACK 0   // safe default
+#endif
 #define TEST_FPS 3000
 #define TEST_IDS 40
-
-#define CAN_TX_PIN 4
-#define CAN_RX_PIN 5
+#define CAN_TX_PIN 5
+#define CAN_RX_PIN 4
 
 #define RATE_COUNT 4
 static const char *RATE_NAMES[RATE_COUNT] = {"500k", "250k", "125k", "1M"};
@@ -32,9 +27,14 @@ static uint32_t recoveries = 0;
 static uint32_t peakBatch = 0;
 static uint32_t lastStat = 0;
 static uint32_t lastFrameMs = 0;
+static uint32_t cmdBytes = 0;
+static uint32_t maxGap = 0;
+static uint32_t lastLoopU = 0;
 
 static char out[2048];
 static int outN = 0;
+static char cmd[32];
+static int cmdN = 0;
 
 twai_timing_config_t timingFor(int i) {
   switch (i) {
@@ -62,7 +62,7 @@ void canStop() {
   twai_driver_uninstall();
 }
 
-// Listens for one second at each rate. Returns the best index, or -1 if nothing was heard.
+// Listens one second at each rate. Returns the best index, or -1 if nothing was heard.
 int autobaud() {
   int best = -1;
   int bestScore = 0;
@@ -127,7 +127,7 @@ void printStat() {
 
   Serial.printf("# stat up=%lu frames=%lu mode=%s rate=%s state=%s tec=%lu rec=%lu "
                 "buserr=%lu missed=%lu rxq=%lu peakq=%lu recov=%lu usbdrop=%lu "
-                "heap=%lu minheap=%lu rst=%s\n",
+                "heap=%lu minheap=%lu maxgap=%lu cmdrx=%lu rst=%s\n",
                 (unsigned long)(millis() / 1000), (unsigned long)frames,
                 TEST_LOOPBACK ? "loopback" : "listen", RATE_NAMES[rateIdx],
                 stateName(s.state), (unsigned long)s.tx_error_counter,
@@ -135,8 +135,24 @@ void printStat() {
                 (unsigned long)s.rx_missed_count, (unsigned long)s.msgs_to_rx,
                 (unsigned long)peakBatch, (unsigned long)recoveries,
                 (unsigned long)usbDropped, (unsigned long)ESP.getFreeHeap(),
-                (unsigned long)ESP.getMinFreeHeap(), resetName());
+                (unsigned long)ESP.getMinFreeHeap(), (unsigned long)maxGap,
+                (unsigned long)cmdBytes, resetName());
   peakBatch = 0;
+  maxGap = 0;
+}
+
+void pollCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    cmdBytes++;
+    if (c == '\n' || c == '\r') {
+      cmd[cmdN] = 0;
+      if (cmdN && !strcmp(cmd, "ping")) Serial.printf("# pong rx=%lu\n", (unsigned long)cmdBytes);
+      cmdN = 0;
+    } else if (cmdN < (int)sizeof(cmd) - 1) {
+      cmd[cmdN++] = c;
+    }
+  }
 }
 
 void flushOut() {
@@ -166,7 +182,7 @@ void emit(const twai_message_t &m) {
 static int64_t nextTestUs = 0;
 static uint32_t testSeq = 0;
 
-// The web page checks these exact patterns. If you change them here, change checkTest() there.
+// The page checks these exact patterns. If you change them here, change checkTest() there.
 void generateTestFrames() {
   int64_t now = esp_timer_get_time();
   if (nextTestUs == 0) nextTestUs = now;
@@ -186,18 +202,18 @@ void generateTestFrames() {
     } else {
       t.identifier = 0x100 + k * 0x10;
       t.data_length_code = 8;
-      t.data[0] = round;                // counter
-      t.data[1] = 0xAA;                 // constant
-      t.data[2] = (round >> 2) & 1;     // slow switch
+      t.data[0] = round;
+      t.data[1] = 0xAA;
+      t.data[2] = (round >> 2) & 1;
       t.data[3] = k;
       t.data[4] = (round * 7) & 0xFF;
     }
-    if (twai_transmit(&t, 0) != ESP_OK) break;   // queue full, try again next pass
+    if (twai_transmit(&t, 0) != ESP_OK) break;
     testSeq++;
     nextTestUs += 1000000 / TEST_FPS;
     sent++;
   }
-  if (nextTestUs < now - 100000) nextTestUs = now;   // fell far behind, resync
+  if (nextTestUs < now - 100000) nextTestUs = now;
 }
 #endif
 
@@ -217,9 +233,16 @@ void setup() {
   lastFrameMs = millis();
 #endif
   Serial.printf("# boot reset=%s rate=%s\n", resetName(), RATE_NAMES[rateIdx]);
+  lastLoopU = micros();
 }
 
 void loop() {
+  uint32_t u = micros();
+  uint32_t g = u - lastLoopU;
+  lastLoopU = u;
+  if (g > maxGap) maxGap = g;
+
+  pollCommands();
 #if TEST_LOOPBACK
   generateTestFrames();
 #endif
