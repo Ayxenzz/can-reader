@@ -14,7 +14,8 @@
   table { border-collapse: collapse; font: 13px ui-monospace, monospace; width: 100%; }
   th, td { padding: 3px 6px; text-align: left; border-bottom: 1px solid #8884; white-space: nowrap; }
   td.n { text-align: right; }
-  .b { display: inline-block; width: 2.2ch; text-align: center; }
+  .b { display: inline-block; width: 2.2ch; text-align: center; transition: background-color 1s linear; }
+  .b.hot { background-color: #e8b400; color: #000; transition: none; }
 </style>
 </head>
 <body>
@@ -34,8 +35,11 @@ const info = document.getElementById('info');
 const warn = document.getElementById('warn');
 const body = document.getElementById('body');
 
+const H = Array.from({ length: 256 }, (_, i) => i.toString(16).toUpperCase().padStart(2, '0'));
+
 const rows = new Map();
 const dirty = new Set();
+const hot = new Map();   // span -> time its highlight may end
 let needSort = false;
 let total = 0, lastTotal = 0, bad = 0, bytes = 0, lastBytes = 0;
 let fMark = null, totalMark = 0, lost = 0, lostAcc = 0;
@@ -44,7 +48,7 @@ let lastByteT = 0, lastFrameT = 0;
 let st = {}, lastUp = -1, reboots = 0, dev = '';
 let badData = 0, seqGaps = 0, testMode = false;
 let badLines = [];
-let paintMax = 0, lagMs = 0;
+let paintMax = 0, paintRunMax = 0, lagMs = 0, lagRunMax = 0;
 let status = 'Not connected.';
 let port = null, reader = null;
 
@@ -139,6 +143,7 @@ function makeRow(r) {
   for (let i = 0; i < 8; i++) {
     const sp = document.createElement('span');
     sp.className = 'b';
+    sp._t = '';
     data.appendChild(sp);
     spans.push(sp);
   }
@@ -159,15 +164,22 @@ function paint() {
     r.c.period.textContent = r.period ? r.period.toFixed(1) : '';
     for (let i = 0; i < 8; i++) {
       const sp = r.c.spans[i];
-      sp.textContent = i < r.dlc ? r.bytes[i].toString(16).toUpperCase().padStart(2, '0') : '';
+      const txt = i < r.dlc ? H[r.bytes[i]] : '';
+      if (sp._t !== txt) { sp.textContent = txt; sp._t = txt; }
       if (r.chg[i]) {
         r.chg[i] = false;
-        sp.animate([{ background: '#e8b400', color: '#000' }, { background: 'transparent' }], { duration: 1000 });
+        if (!sp.classList.contains('hot')) sp.classList.add('hot');
+        hot.set(sp, a + 150);   // hold the highlight briefly, then let the CSS transition fade it
       }
     }
   }
   dirty.clear();
-  paintMax = Math.max(paintMax, performance.now() - a);
+  for (const [sp, until] of hot) {
+    if (a >= until) { sp.classList.remove('hot'); hot.delete(sp); }
+  }
+  const d = performance.now() - a;
+  if (d > paintMax) paintMax = d;
+  if (d > paintRunMax) paintRunMax = d;
   requestAnimationFrame(paint);
 }
 
@@ -183,6 +195,7 @@ setInterval(() => {
   const fps = (total - lastTotal) / dt;
   const kbs = (bytes - lastBytes) / 1024 / dt;
   lagMs = Math.max(0, dt * 1000 - 1000);
+  if (live && lagMs > lagRunMax) lagRunMax = lagMs;
   lastT = t; lastTotal = total; lastBytes = bytes;
   if (live && el > 2) minFps = Math.min(minFps, fps);
 
@@ -205,7 +218,8 @@ setInterval(() => {
     L.push('usbdrop ' + st.usbdrop + ' heap ' + kb(st.heap) + ' min ' + kb(st.minheap));
     L.push('reset ' + st.rst + '  reboots seen ' + reboots);
   }
-  L.push('page paint ' + paintMax.toFixed(1) + 'ms  tick lag ' + lagMs.toFixed(0) + 'ms');
+  L.push('paint ' + paintMax.toFixed(1) + 'ms (run max ' + paintRunMax.toFixed(1) + ')');
+  L.push('tick lag ' + lagMs.toFixed(0) + 'ms (run max ' + lagRunMax.toFixed(0) + ')');
   if (badLines.length) L.push('bad lines ' + badLines.join(' | '));
   if (dev) L.push(dev);
   info.textContent = L.join('\n');
@@ -227,12 +241,12 @@ async function connect() {
   } catch (e) { status = 'Could not open port. ' + e.message; return; }
 
   // fresh run, reset everything
-  rows.clear(); dirty.clear(); body.innerHTML = '';
+  rows.clear(); dirty.clear(); hot.clear(); body.innerHTML = '';
   total = lastTotal = bad = bytes = lastBytes = 0;
   fMark = null; totalMark = 0; lost = 0; lostAcc = 0;
   st = {}; lastUp = -1; reboots = 0; dev = '';
   badData = 0; seqGaps = 0; testMode = false; badLines = [];
-  paintMax = 0; lagMs = 0;
+  paintMax = 0; paintRunMax = 0; lagMs = 0; lagRunMax = 0;
   t0 = performance.now(); lastT = t0; endT = null; minFps = Infinity;
   lastByteT = t0; lastFrameT = t0;
 
