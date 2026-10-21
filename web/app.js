@@ -1,4 +1,5 @@
 import { compile, run, show } from './formula.js';
+import { initExtras } from './extras.js';
 
 const $ = (id) => document.getElementById(id);
 const btn = $('btn'), info = $('info'), warn = $('warn'), body = $('body'), head = $('head');
@@ -43,6 +44,7 @@ async function getWake() {
 // cols is a list of { name, formula, cells } where cells maps a row ID in hex to its own formula.
 let cols = [];
 try { cols = JSON.parse(localStorage.getItem('canreader.cols') || '[]'); } catch (e) {}
+let tap = null;   // set by extras.js, called when a byte changes
 const compiled = new Map();
 function fnFor(src) {
   if (!compiled.has(src)) { try { compiled.set(src, compile(src)); } catch (e) { compiled.set(src, e); } }
@@ -162,7 +164,7 @@ function onLine(s) {
   r.dlc = dlc;
   for (let i = 0; i < dlc; i++) {
     const v = parseInt(hex.substr(i * 2, 2), 16);
-    if (r.bytes[i] !== undefined && r.bytes[i] !== v) r.chg[i] = true;
+    if (r.bytes[i] !== undefined && r.bytes[i] !== v) { r.chg[i] = true; if (tap) tap(r, i, r.bytes[i] ^ v); }
     r.bytes[i] = v;
   }
   r.bytes.length = dlc;
@@ -337,4 +339,5 @@ if ('serial' in navigator) {
 btn.onclick = () => { if (reader) reader.cancel(); else connect(); };
 
 rebuildCols();
+initExtras({ getCols: () => cols, setCols: (c) => { cols = c; rebuildCols(); }, setTap: (f) => { tap = f; }, ev });
 requestAnimationFrame(paint);
