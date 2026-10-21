@@ -183,7 +183,7 @@ void emit(const twai_message_t &m) {
 }
 
 #if SCANNER
-// ---- OBD-II over CAN (ISO 15765-4), probe plus trouble codes, with diagnostics ----
+// ---- OBD-II over CAN (ISO 15765-4), probe, MIL status and trouble codes ----
 struct Ecu {
   bool used, done;
   uint32_t id;
@@ -227,6 +227,12 @@ static Ecu *slotFor(uint32_t id) {
   return nullptr;
 }
 
+// Physical request ID for an ECU, from the ID it replied on.
+static uint32_t physFor(uint32_t replyId, bool ext) {
+  if (ext) return 0x18DA0000 | ((replyId & 0xFF) << 8) | 0xF1;   // 18DAF1xx -> 18DAxxF1
+  return replyId - 8;                                             // 7E8 -> 7E0
+}
+
 static void scanFrame(const twai_message_t &m) {
   if (m.data_length_code < 2) return;
   Ecu *ep = slotFor(m.identifier);
@@ -253,9 +259,7 @@ static void scanFrame(const twai_message_t &m) {
     if (e.got >= e.total) e.done = true;
     else {
       uint8_t fc[8] = {0x30, 0x00, 0x00, 0, 0, 0, 0, 0};   // flow control, send the rest
-      uint32_t fcId = m.extd ? (0x18DA0000 | ((m.identifier & 0xFF) << 8) | 0xF1)
-                             : (m.identifier - 8);
-      sendFrame(fcId, m.extd, fc);
+      sendFrame(physFor(m.identifier, m.extd), m.extd, fc);
     }
   } else if (pci == 0x20 && e.used && !e.done) {   // consecutive frame
     if ((m.data[0] & 0x0F) != (e.seq & 0x0F)) return;
@@ -326,6 +330,24 @@ static int probe(uint32_t id, bool ext, const char *tag) {
   return n;
 }
 
+// Mode 01 PID 01. The first data byte holds the check engine light bit and the stored code count.
+static void milStatus(uint32_t rid, bool rext) {
+  memset(ecus, 0, sizeof(ecus));
+  seenN = 0;
+  uint8_t req[8] = {0x02, 0x01, 0x01, 0, 0, 0, 0, 0};
+  sendFrame(rid, rext, req);
+  waitReplies(1000);
+  int n = 0;
+  for (int i = 0; i < 8; i++) {
+    Ecu &u = ecus[i];
+    if (!u.used || !u.done || u.got < 3 || u.buf[0] != 0x41 || u.buf[1] != 0x01) continue;
+    n++;
+    Serial.printf("# dtc status ecu=%lX mil=%s count=%u\n", (unsigned long)u.id,
+                  (u.buf[2] & 0x80) ? "on" : "off", (unsigned)(u.buf[2] & 0x7F));
+  }
+  if (!n) Serial.println("# dtc status no response");
+}
+
 static int reportEcus(uint8_t mode) {
   int answered = 0;
   for (int i = 0; i < 8; i++) {
@@ -354,13 +376,30 @@ static int reportEcus(uint8_t mode) {
   return answered;
 }
 
-static void scanMode(uint8_t mode, uint32_t rid, bool rext) {
+static bool anyReply() {
+  for (int i = 0; i < 8; i++) if (ecus[i].used) return true;
+  return false;
+}
+
+// Asks on the functional ID first. If nobody answers, asks each known ECU on its physical ID.
+static void scanMode(uint8_t mode, uint32_t rid, bool rext, const uint32_t *found, int nFound) {
   memset(ecus, 0, sizeof(ecus));
   seenN = 0;
   uint8_t req[8] = {0x01, mode, 0, 0, 0, 0, 0, 0};
   sendFrame(rid, rext, req);
-  waitReplies(1500);
+  waitReplies(1200);
+  if (!anyReply()) {
+    for (int k = 0; k < nFound; k++) {
+      uint32_t pid = physFor(found[k], rext);
+      Serial.printf("# dtc mode=%02X trying physical %lX\n", mode, (unsigned long)pid);
+      sendFrame(pid, rext, req);
+      waitReplies(1200);
+    }
+  }
   if (!reportEcus(mode)) Serial.printf("# dtc mode=%02X no response\n", mode);
+  char tag[8];
+  snprintf(tag, sizeof(tag), "m%02X", mode);
+  printTxInfo(tag);
 }
 
 static void runScan() {
@@ -389,9 +428,13 @@ static void runScan() {
   }
 
   if (n) {
-    scanMode(0x03, rid, rext);   // stored
-    scanMode(0x07, rid, rext);   // pending
-    scanMode(0x0A, rid, rext);   // permanent
+    uint32_t found[4];
+    int nFound = 0;
+    for (int i = 0; i < 8 && nFound < 4; i++) if (ecus[i].used) found[nFound++] = ecus[i].id;
+    milStatus(rid, rext);
+    scanMode(0x03, rid, rext, found, nFound);   // stored
+    scanMode(0x07, rid, rext, found, nFound);   // pending
+    scanMode(0x0A, rid, rext, found, nFound);   // permanent
   } else {
     Serial.println("# dtc no reply to any probe, code reads skipped");
   }
