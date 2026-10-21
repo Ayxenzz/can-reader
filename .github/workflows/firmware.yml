@@ -19,20 +19,18 @@ jobs:
           path: ~/.platformio
           key: pio-${{ hashFiles('firmware/platformio.ini') }}
       - run: pip install platformio
-      - run: pio run -e car -e scanner -e loopback
+      - run: pio run
         working-directory: firmware
-      - name: Merge images
+      - name: Merge into one image
         working-directory: firmware
         run: |
-          for e in car scanner loopback; do
-            python ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32s3 merge_bin \
-              -o merged-$e.bin --flash_mode qio --flash_freq 80m --flash_size 16MB \
-              0x0 .pio/build/$e/bootloader.bin \
-              0x8000 .pio/build/$e/partitions.bin \
-              0xe000 ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
-              0x10000 .pio/build/$e/firmware.bin
-          done
+          python ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32s3 merge_bin \
+            -o merged.bin --flash_mode qio --flash_freq 80m --flash_size 16MB \
+            0x0 .pio/build/esp32s3/bootloader.bin \
+            0x8000 .pio/build/esp32s3/partitions.bin \
+            0xe000 ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
+            0x10000 .pio/build/esp32s3/firmware.bin
       - uses: actions/upload-artifact@v4
         with:
           name: firmware
-          path: firmware/merged-*.bin
+          path: firmware/merged.bin
