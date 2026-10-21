@@ -1,5 +1,5 @@
 // Formula engine. Formulas are checked token by token, so only the names listed here can
-// appear and nothing else is ever executed.
+// appear and nothing else is ever executed. Strings cannot contain a backslash.
 let fmt = null, cur = [];
 
 const bitAt = (p) => { const b = cur[p >> 3]; return b === undefined ? NaN : (b >> (p & 7)) & 1; };
@@ -29,7 +29,7 @@ const VARS = ['b0', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'id', 'dlc', 'ext'
 const ARGS = [...VARS, 'col', ...Object.keys(helpers)];
 const NAMES = new Set([...ARGS, 'none', 'true', 'false']);
 NAMES.delete('col');   // [name] is the only way to reach col
-const TOKEN = /\s+|0x[0-9a-f]+|0b[01]+|\d+(?:\.\d+)?|"[^"]*"|'[^']*'|\[[^\]]+\]|[a-z_]\w*|===|!==|==|!=|<=|>=|<<|>>>|>>|&&|\|\||[-+*\/%&|^~<>!?:(),{}]/iy;
+const TOKEN = /\s+|0x[0-9a-f]+|0b[01]+|\d+(?:\.\d+)?|"[^"\\]*"|'[^'\\]*'|\[[^\]]+\]|[a-z_]\w*|===|!==|==|!=|<=|>=|<<|>>>|>>|&&|\|\||[-+*\/%&|^~<>!?:(),{}]/iy;
 
 export function compile(src) {
   let js = '', i = 0;
