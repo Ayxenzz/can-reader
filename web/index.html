@@ -29,16 +29,6 @@
   <button id="copy">Copy log</button><button id="clear">Clear</button>
   <pre id="log"></pre>
 </details>
-<details>
-  <summary>Trouble codes</summary>
-  <button id="dtcB">Read codes</button>
-  <pre id="diag">Needs the scanner firmware. Ignition on, engine off.</pre>
-</details>
-<details>
-  <summary>Tests</summary>
-  <button id="runT">Run tests</button><button id="pingB">Ping board</button><button id="fileB">Save file test</button>
-  <pre id="tests"></pre>
-</details>
 <div class="wrap">
   <table>
     <thead><tr><th>ID</th><th>Count</th><th>ms</th><th>Data</th></tr></thead>
@@ -49,7 +39,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const btn = $('btn'), info = $('info'), warn = $('warn'), body = $('body');
-const logEl = $('log'), logBox = $('logbox'), testEl = $('tests'), diagEl = $('diag');
+const logEl = $('log'), logBox = $('logbox');
 const H = Array.from({ length: 256 }, (_, i) => i.toString(16).toUpperCase().padStart(2, '0'));
 
 const rows = new Map(), dirty = new Set(), hot = new Map(), prevs = {};
@@ -58,10 +48,9 @@ let total = 0, lastTotal = 0, bad = 0, bytes = 0, lastBytes = 0;
 let fMark = null, totalMark = 0, lost = 0, lostAcc = 0;
 let t0 = null, endT = null, lastT = 0, minFps = Infinity;
 let lastByteT = 0, lastFrameT = 0, noData = false, noFrames = false;
-let st = {}, lastUp = -1, reboots = 0, dev = '';
-let badData = 0, seqGaps = 0, testMode = false, badLines = [];
+let st = {}, lastUp = -1, reboots = 0, dev = '', badLines = [];
 let paintMax = 0, paintRunMax = 0, lagMs = 0, lagRunMax = 0;
-let idsEarly = 0, earlyDone = false, pingAt = 0, diagAt = 0;
+let idsEarly = 0, earlyDone = false;
 let status = 'Not connected.', port = null, reader = null, busy = false, wake = null;
 
 // ---- event log, kept across page reloads ----
@@ -73,12 +62,6 @@ function ev(m) {
   logDirty = true;
 }
 ev('--- page loaded ---');
-let boot = { first: Date.now(), loads: 1 };
-try {
-  const p = JSON.parse(localStorage.getItem('canreader.boot') || 'null');
-  if (p) boot = { first: p.first, loads: p.loads + 1 };
-  localStorage.setItem('canreader.boot', JSON.stringify(boot));
-} catch (e) {}
 setInterval(() => {
   if (!logDirty) return;
   try { localStorage.setItem('canreader.log', JSON.stringify(logArr.slice(-200))); } catch (e) {}
@@ -108,24 +91,6 @@ async function getWake() {
 }
 
 // ---- parsing ----
-// Must match generateTestFrames() in the firmware.
-function checkTest(r, b) {
-  let ok, round;
-  if (r.ext === '1') {
-    ok = r.id === 0x1ABCDE01 && b.length === 4 && b[0] === 0xDE && b[1] === 0xAD && b[2] === 0xBE;
-    round = b[3];
-  } else {
-    const k = (r.id - 0x100) / 16;
-    round = b[0];
-    ok = b.length === 8 && Number.isInteger(k) && k >= 0 && k < 39 &&
-         b[1] === 0xAA && b[2] === ((b[0] >> 2) & 1) && b[3] === k &&
-         b[4] === ((b[0] * 7) & 255) && b[5] === 0 && b[6] === 0 && b[7] === 0;
-  }
-  if (!ok) { badData++; return; }
-  if (r.round !== undefined && round !== ((r.round + 1) & 255)) seqGaps++;
-  r.round = round;
-}
-
 function onStat(s) {
   const o = {};
   for (const kv of s.slice(7).split(' ')) {
@@ -138,34 +103,20 @@ function onStat(s) {
       reboots++;
       ev('device restarted, reset ' + o.rst);
       lostAcc += lost; fMark = null; lost = 0;
-      for (const r of rows.values()) r.round = undefined;
     }
     lastUp = up;
   }
   if (!isNaN(f)) {
     if (fMark === null) { fMark = f; totalMark = total; lost = 0; }
-    else lost = (f - fMark) - (total - totalMark);
+    else lost = (f - fMark) - (total - totalMark);   // sent since mark minus counted since mark
   }
   const prev = st;
   st = o;
-  if (prev.up === undefined) ev('device ' + o.mode + ' ' + o.rate + ' reset ' + o.rst);
-  else for (const k of ['state', 'rate', 'buserr', 'missed', 'recov', 'usbdrop']) {
+  if (prev.up === undefined) ev('device ' + o.rate + ' reset ' + o.rst);
+  else for (const k of ['state', 'rate', 'buserr', 'missed', 'recov', 'usbdrop', 'ringdrop']) {
     if (prev[k] !== o[k]) ev('dev ' + k + ' ' + prev[k] + ' to ' + o[k]);
   }
   if (Number(o.maxgap) > 50000) ev('dev loop gap ' + (o.maxgap / 1000).toFixed(0) + ' ms');
-  testMode = o.mode === 'loopback';
-}
-
-function onDtc(s) {
-  diagAt = 0;
-  let t = s.slice(6);
-  t = t.replace('mode=03', 'stored').replace('mode=07', 'pending').replace('mode=0A', 'permanent');
-  if (t.startsWith('start')) diagEl.textContent = '';
-  diagEl.textContent += t + '\n';
-  ev('dtc ' + t);
-  if (t.startsWith('done') && /\sU\d/.test(diagEl.textContent)) {
-    diagEl.textContent += 'U codes are network faults.\n';
-  }
 }
 
 function onLine(s) {
@@ -173,10 +124,7 @@ function onLine(s) {
   if (!s) return;
   if (s[0] === '#') {
     if (s.startsWith('# stat ')) onStat(s);
-    else if (s.startsWith('# dtc')) onDtc(s);
-    else if (s.startsWith('# pong')) {
-      if (pingAt) { tline('PASS ping board  ' + (performance.now() - pingAt).toFixed(0) + ' ms  ' + s); ev('ping ok'); pingAt = 0; }
-    } else dev = s;
+    else { dev = s; ev('dev ' + s.slice(2)); }
     return;
   }
   const p = s.split(',');
@@ -207,7 +155,6 @@ function onLine(s) {
     r.bytes[i] = v;
   }
   r.bytes.length = dlc;
-  if (testMode) checkTest(r, r.bytes);
   dirty.add(r);
   total++;
   lastFrameT = performance.now();
@@ -302,8 +249,6 @@ setInterval(() => {
     if (!earlyDone && el > 5) { earlyDone = true; ev(idsEarly + ' ids seen in first 5 s'); }
     delta('lost', lostAll, 'lost');
     delta('bad', bad, 'malformed' + (badLines.length ? ' e.g. ' + badLines[badLines.length - 1] : ''));
-    delta('wrong', badData, 'wrong data');
-    delta('gaps', seqGaps, 'seq gaps');
   }
 
   const L = [];
@@ -313,13 +258,12 @@ setInterval(() => {
   L.push('KB/s now ' + (live ? kbs.toFixed(1) : '-') + ' avg ' + (bytes / 1024 / el).toFixed(1));
   L.push('total ' + total + '  ids ' + rows.size + '  malformed ' + bad);
   L.push('lost ' + (fMark === null && lostAcc === 0 ? '-' : lostAll) + ' (' + pct + '%)');
-  if (testMode) L.push('test wrong data ' + badData + '  seq gaps ' + seqGaps);
   if (st.up !== undefined) {
-    L.push('dev up ' + st.up + 's ' + st.mode + ' ' + st.rate + ' ' + st.state);
+    L.push('dev up ' + st.up + 's ' + st.rate + ' ' + st.state);
     L.push('tec ' + st.tec + ' rec ' + st.rec + ' buserr ' + st.buserr);
-    L.push('missed ' + st.missed + ' peakq ' + st.peakq + ' recov ' + st.recov);
-    L.push('usbdrop ' + st.usbdrop + ' heap ' + kb(st.heap) + ' min ' + kb(st.minheap));
-    L.push('loop gap max ' + (st.maxgap / 1000).toFixed(1) + 'ms  cmdrx ' + st.cmdrx);
+    L.push('missed ' + st.missed + ' recov ' + st.recov + ' rxq ' + st.rxq);
+    L.push('ring peak ' + st.peakfill + ' drop ' + st.ringdrop + '  usbdrop ' + st.usbdrop);
+    L.push('heap ' + kb(st.heap) + ' min ' + kb(st.minheap) + '  loop gap max ' + (st.maxgap / 1000).toFixed(1) + 'ms');
     L.push('reset ' + st.rst + '  reboots seen ' + reboots);
   }
   L.push('paint ' + paintMax.toFixed(1) + 'ms (run max ' + paintRunMax.toFixed(1) + ')');
@@ -335,7 +279,6 @@ setInterval(() => {
   if (live && noData) w.push('NO USB DATA');
   else if (live && noFrames) w.push('No frames. Bus quiet or wrong bitrate.');
   if (reboots) w.push('Device restarted ' + reboots + 'x');
-  if (testMode && (badData || seqGaps)) w.push('Test data errors');
   warn.textContent = w.join('\n');
 }, 1000);
 
@@ -358,8 +301,7 @@ async function connect(p) {
   rows.clear(); dirty.clear(); hot.clear(); body.innerHTML = '';
   total = lastTotal = bad = bytes = lastBytes = 0;
   fMark = null; totalMark = 0; lost = 0; lostAcc = 0;
-  st = {}; lastUp = -1; reboots = 0; dev = '';
-  badData = 0; seqGaps = 0; testMode = false; badLines = [];
+  st = {}; lastUp = -1; reboots = 0; dev = ''; badLines = [];
   paintMax = 0; paintRunMax = 0; lagMs = 0; lagRunMax = 0;
   for (const k in prevs) delete prevs[k];
   noData = noFrames = false; idsEarly = 0; earlyDone = false;
@@ -420,113 +362,6 @@ if ('serial' in navigator) {
   tryAuto();
 }
 btn.onclick = () => { if (reader) reader.cancel(); else connect(); };
-
-async function sendCmd(c) {
-  const w = port.writable.getWriter();
-  try { await w.write(new TextEncoder().encode(c + '\n')); } finally { w.releaseLock(); }
-}
-
-// ---- trouble codes ----
-$('dtcB').onclick = async () => {
-  if (!port) { diagEl.textContent = 'Connect first.\n'; return; }
-  diagEl.textContent = 'Reading, takes about 5 s...\n';
-  try {
-    await sendCmd('dtc');
-    diagAt = performance.now();
-    ev('read codes requested');
-    setTimeout(() => { if (diagAt) { diagEl.textContent += 'No reply from the board.\n'; diagAt = 0; } }, 15000);
-  } catch (e) { diagEl.textContent = 'Write failed. ' + e.message + '\n'; }
-};
-
-// ---- tests ----
-const tline = (s) => { testEl.textContent += s + '\n'; };
-const ago = (t) => { const s = (Date.now() - t) / 1000; return s < 90 ? s.toFixed(0) + 's' : s < 5400 ? (s / 60).toFixed(0) + 'm' : (s / 3600).toFixed(1) + 'h'; };
-
-function idbTest() {
-  return new Promise((res, rej) => {
-    const q = indexedDB.open('canreader', 1);
-    q.onupgradeneeded = () => q.result.createObjectStore('k');
-    q.onerror = () => rej(q.error);
-    q.onsuccess = () => {
-      const db = q.result, tx = db.transaction('k', 'readwrite'), s = tx.objectStore('k'), g = s.get('t');
-      g.onsuccess = () => {
-        const prev = g.result;
-        s.put(Date.now(), 't');
-        tx.oncomplete = () => { db.close(); res(prev ? 'previous write ' + ago(prev) + ' ago' : 'first write'); };
-      };
-      tx.onerror = () => rej(tx.error);
-    };
-  });
-}
-
-function workerTest() {
-  return new Promise((res) => {
-    try {
-      const w = new Worker(URL.createObjectURL(new Blob(['onmessage=e=>postMessage(e.data+1)'])));
-      const t = setTimeout(() => { w.terminate(); res(false); }, 1500);
-      w.onmessage = (e) => { clearTimeout(t); w.terminate(); res(e.data === 2); };
-      w.onerror = () => { clearTimeout(t); res(false); };
-      w.postMessage(1);
-    } catch (e) { res(false); }
-  });
-}
-
-$('runT').onclick = async () => {
-  testEl.textContent = '';
-  const T = (n, ok, d) => tline((ok === null ? 'INFO ' : ok ? 'PASS ' : 'FAIL ') + n + (d !== undefined ? '  ' + d : ''));
-  T('secure context', window.isSecureContext, location.origin);
-  T('web serial', 'serial' in navigator);
-  try { T('granted ports', null, String((await navigator.serial.getPorts()).length)); } catch (e) { T('getPorts', false, e.message); }
-  if (port) {
-    try { const i = port.getInfo(); T('port info', null, 'vid ' + (i.usbVendorId || 0).toString(16) + ' pid ' + (i.usbProductId || 0).toString(16)); } catch (e) { T('port info', false, e.message); }
-    T('setSignals', typeof port.setSignals === 'function');
-    T('port.writable', !!port.writable);
-  } else T('port tests', null, 'connect first');
-  try {
-    localStorage.setItem('canreader.t', '1');
-    T('localStorage', localStorage.getItem('canreader.t') === '1', 'loads ' + boot.loads + ', first ' + ago(boot.first) + ' ago');
-  } catch (e) { T('localStorage', false, e.message); }
-  try { T('indexedDB', true, await idbTest()); } catch (e) { T('indexedDB', false, String(e)); }
-  T('file picker api', 'showSaveFilePicker' in window);
-  try { await navigator.clipboard.writeText('can-reader test'); T('clipboard write', true); } catch (e) { T('clipboard write', false, e.name); }
-  T('wake lock api', 'wakeLock' in navigator, wake ? 'held' : 'not held');
-  T('web worker', await workerTest());
-  T('bigint', typeof BigInt === 'function');
-  T('js heap api', !!performance.memory);
-  tline('Next. Press Ping board and Save file test. Then close the app, reopen, and run again. loads should go up and indexedDB should report a previous write.');
-};
-
-$('pingB').onclick = async () => {
-  if (!port) { tline('FAIL ping board  not connected'); return; }
-  try {
-    await sendCmd('ping');
-    pingAt = performance.now();
-    setTimeout(() => { if (pingAt) { tline('FAIL ping board  no pong in 2 s'); ev('ping failed'); pingAt = 0; } }, 2000);
-  } catch (e) { tline('FAIL ping board  write failed ' + e.message); ev('ping write failed ' + e.message); }
-};
-
-$('fileB').onclick = async () => {
-  const txt = 'can-reader file test ' + new Date().toISOString() + '\n';
-  if ('showSaveFilePicker' in window) {
-    try {
-      const h = await showSaveFilePicker({ suggestedName: 'can-test.txt' });
-      const w = await h.createWritable();
-      await w.write(txt);
-      await w.close();
-      tline('PASS file picker write');
-      ev('file picker write ok');
-      return;
-    } catch (e) { tline('FAIL file picker  ' + e.name); }
-  }
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([txt]));
-  a.download = 'can-test.txt';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  tline('INFO download triggered. Check your Downloads for can-test.txt.');
-  ev('download fallback triggered');
-};
 
 requestAnimationFrame(paint);
 </script>
