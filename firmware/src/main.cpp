@@ -1,6 +1,7 @@
 // ESP32 CAN reader. Frame lines are ts_us,id_hex,ext,dlc,data_hex. Lines starting with # are status.
 // Env "car"      listen-only, scans bitrates, never transmits.
-// Env "scanner"  same as car, plus a "dtc" command that reads trouble codes (it transmits briefly).
+// Env "scanner"  same as car, plus a "dtc" command that probes the car and reads trouble codes.
+//                It transmits a few single-shot request frames. Everything else stays listen-only.
 // Env "loopback" transmits test frames, needs GPIO 4 jumpered to GPIO 5. NEVER use on a car.
 // Commands from the page: "ping" and "dtc".
 
@@ -9,6 +10,7 @@
 #include "driver/twai.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_err.h"
 
 #ifndef TEST_LOOPBACK
 #define TEST_LOOPBACK 0   // safe default
@@ -66,10 +68,12 @@ void canStop() {
   twai_driver_uninstall();
 }
 
-// Listens one second at each rate. Returns the best index, or -1 if nothing was heard.
+// Listens one second at each rate. Picks the rate that received the most frames.
+// Errors only break ties, so a noisy link still locks on. Returns -1 if no rate got a frame.
 int autobaud() {
   int best = -1;
-  int bestScore = 0;
+  uint32_t bestFrames = 0;
+  uint32_t bestErr = 0;
   for (int i = 0; i < RATE_COUNT; i++) {
     if (!canStart(i, TWAI_MODE_LISTEN_ONLY)) continue;
     uint32_t got = 0;
@@ -81,10 +85,14 @@ int autobaud() {
     twai_status_info_t s;
     twai_get_status_info(&s);
     canStop();
-    int score = (int)got - 10 * (int)s.bus_error_count;
+    uint32_t err = s.bus_error_count;
     Serial.printf("# autobaud %s frames=%lu errors=%lu\n", RATE_NAMES[i],
-                  (unsigned long)got, (unsigned long)s.bus_error_count);
-    if (score > bestScore) { bestScore = score; best = i; }
+                  (unsigned long)got, (unsigned long)err);
+    if (got > bestFrames || (got > 0 && got == bestFrames && err < bestErr)) {
+      bestFrames = got;
+      bestErr = err;
+      best = i;
+    }
   }
   return best;
 }
@@ -175,27 +183,55 @@ void emit(const twai_message_t &m) {
 }
 
 #if SCANNER
-// ---- trouble code reading (OBD-II services 03, 07, 0A over CAN, ISO 15765-4) ----
+// ---- OBD-II over CAN (ISO 15765-4), probe plus trouble codes, with diagnostics ----
 struct Ecu {
   bool used, done;
+  uint32_t id;
   uint16_t total, got;
   uint8_t seq;
   uint8_t buf[128];
 };
 static Ecu ecus[8];
+static uint32_t seenIds[8];
+static int seenN = 0;
 static uint32_t lastScanMs = 0;
 
-static void sendFrame(uint32_t id, const uint8_t *d) {
+static esp_err_t sendFrame(uint32_t id, bool ext, const uint8_t *d) {
   twai_message_t t = {};
   t.identifier = id;
+  t.extd = ext ? 1 : 0;
+  t.ss = 1;                  // single shot, one attempt only
   t.data_length_code = 8;
   memcpy(t.data, d, 8);
-  twai_transmit(&t, pdMS_TO_TICKS(50));
+  return twai_transmit(&t, pdMS_TO_TICKS(50));
+}
+
+static bool isObdId(const twai_message_t &m) {
+  if (m.extd) return (m.identifier >> 16) == 0x18DA || (m.identifier >> 16) == 0x18DB;
+  return m.identifier >= 0x7DF && m.identifier <= 0x7EF;
+}
+
+static bool isReply(const twai_message_t &m) {
+  if (m.extd) return (m.identifier >> 8) == 0x18DAF1;       // 18DAF1xx, addressed to the tester
+  return m.identifier >= 0x7E8 && m.identifier <= 0x7EF;
+}
+
+static void noteSeen(uint32_t id) {
+  for (int i = 0; i < seenN; i++) if (seenIds[i] == id) return;
+  if (seenN < 8) seenIds[seenN++] = id;
+}
+
+static Ecu *slotFor(uint32_t id) {
+  for (int i = 0; i < 8; i++) if (ecus[i].used && ecus[i].id == id) return &ecus[i];
+  for (int i = 0; i < 8; i++) if (!ecus[i].used) { ecus[i].id = id; return &ecus[i]; }
+  return nullptr;
 }
 
 static void scanFrame(const twai_message_t &m) {
-  if (m.extd || m.identifier < 0x7E8 || m.identifier > 0x7EF || m.data_length_code < 2) return;
-  Ecu &e = ecus[m.identifier - 0x7E8];
+  if (m.data_length_code < 2) return;
+  Ecu *ep = slotFor(m.identifier);
+  if (!ep) return;
+  Ecu &e = *ep;
   uint8_t pci = m.data[0] & 0xF0;
   if (pci == 0x00) {                         // single frame
     uint8_t n = m.data[0] & 0x0F;
@@ -217,7 +253,9 @@ static void scanFrame(const twai_message_t &m) {
     if (e.got >= e.total) e.done = true;
     else {
       uint8_t fc[8] = {0x30, 0x00, 0x00, 0, 0, 0, 0, 0};   // flow control, send the rest
-      sendFrame(m.identifier - 8, fc);
+      uint32_t fcId = m.extd ? (0x18DA0000 | ((m.identifier & 0xFF) << 8) | 0xF1)
+                             : (m.identifier - 8);
+      sendFrame(fcId, m.extd, fc);
     }
   } else if (pci == 0x20 && e.used && !e.done) {   // consecutive frame
     if ((m.data[0] & 0x0F) != (e.seq & 0x0F)) return;
@@ -230,13 +268,71 @@ static void scanFrame(const twai_message_t &m) {
   }
 }
 
+// Listens for ms milliseconds, collecting replies and streaming frames to the page.
+static void waitReplies(int ms) {
+  int64_t end = esp_timer_get_time() + (int64_t)ms * 1000;
+  twai_message_t m;
+  while (esp_timer_get_time() < end) {
+    if (twai_receive(&m, pdMS_TO_TICKS(5)) != ESP_OK) continue;
+    if (isObdId(m)) noteSeen(m.identifier);
+    if (isReply(m)) scanFrame(m);
+    emit(m);
+    if (outN > 1500) flushOut();
+  }
+  flushOut();
+}
+
+static void printTxInfo(const char *tag) {
+  twai_status_info_t s;
+  if (twai_get_status_info(&s) != ESP_OK) return;
+  Serial.printf("# dtc %s state=%s tec=%lu rec=%lu txfail=%lu arblost=%lu buserr=%lu txq=%lu\n",
+                tag, stateName(s.state), (unsigned long)s.tx_error_counter,
+                (unsigned long)s.rx_error_counter, (unsigned long)s.tx_failed_count,
+                (unsigned long)s.arb_lost_count, (unsigned long)s.bus_error_count,
+                (unsigned long)s.msgs_to_tx);
+}
+
+// Sends Mode 01 PID 00 (supported PIDs). Every OBD-II car must answer this one.
+static int probe(uint32_t id, bool ext, const char *tag) {
+  memset(ecus, 0, sizeof(ecus));
+  seenN = 0;
+  uint8_t req[8] = {0x02, 0x01, 0x00, 0, 0, 0, 0, 0};
+  esp_err_t e = sendFrame(id, ext, req);
+  waitReplies(1500);
+  int n = 0;
+  for (int i = 0; i < 8; i++) {
+    Ecu &u = ecus[i];
+    if (!u.used) continue;
+    n++;
+    char hex[48];
+    int h = 0;
+    hex[0] = 0;
+    for (int k = 0; k < u.got && k < 12 && h < (int)sizeof(hex) - 4; k++) {
+      h += snprintf(hex + h, sizeof(hex) - h, " %02X", u.buf[k]);
+    }
+    Serial.printf("# dtc probe %s ecu=%lX len=%u data%s\n", tag, (unsigned long)u.id, (unsigned)u.got, hex);
+  }
+  Serial.printf("# dtc probe %s tx=%s replies=%d\n", tag, esp_err_to_name(e), n);
+  if (seenN) {
+    char s[96];
+    int c = 0;
+    s[0] = 0;
+    for (int i = 0; i < seenN && c < (int)sizeof(s) - 12; i++) {
+      c += snprintf(s + c, sizeof(s) - c, " %lX", (unsigned long)seenIds[i]);
+    }
+    Serial.printf("# dtc probe %s obd ids seen%s\n", tag, s);
+  }
+  printTxInfo(tag);   // read before the driver restarts, which would clear the counters
+  return n;
+}
+
 static int reportEcus(uint8_t mode) {
   int answered = 0;
   for (int i = 0; i < 8; i++) {
     Ecu &e = ecus[i];
     if (!e.used) continue;
     answered++;
-    unsigned long id = 0x7E8 + i;
+    unsigned long id = e.id;
     if (!e.done || e.got == 0) { Serial.printf("# dtc mode=%02X ecu=%lX incomplete\n", mode, id); continue; }
     if (e.buf[0] == 0x7F) { Serial.printf("# dtc mode=%02X ecu=%lX refused nrc=%02X\n", mode, id, e.got > 2 ? e.buf[2] : 0); continue; }
     if (e.buf[0] != (uint8_t)(mode + 0x40)) { Serial.printf("# dtc mode=%02X ecu=%lX unexpected=%02X\n", mode, id, e.buf[0]); continue; }
@@ -258,19 +354,12 @@ static int reportEcus(uint8_t mode) {
   return answered;
 }
 
-static void scanMode(uint8_t mode) {
+static void scanMode(uint8_t mode, uint32_t rid, bool rext) {
   memset(ecus, 0, sizeof(ecus));
+  seenN = 0;
   uint8_t req[8] = {0x01, mode, 0, 0, 0, 0, 0, 0};
-  sendFrame(0x7DF, req);                     // broadcast request to all ECUs
-  int64_t end = esp_timer_get_time() + 1500000;
-  twai_message_t m;
-  while (esp_timer_get_time() < end) {
-    if (twai_receive(&m, pdMS_TO_TICKS(5)) != ESP_OK) continue;
-    scanFrame(m);
-    emit(m);                                 // keep streaming frames to the page meanwhile
-    if (outN > 1500) flushOut();
-  }
-  flushOut();
+  sendFrame(rid, rext, req);
+  waitReplies(1500);
   if (!reportEcus(mode)) Serial.printf("# dtc mode=%02X no response\n", mode);
 }
 
@@ -286,9 +375,27 @@ static void runScan() {
     canStart(rateIdx, TWAI_MODE_LISTEN_ONLY);
     return;
   }
-  scanMode(0x03);   // stored
-  scanMode(0x07);   // pending
-  scanMode(0x0A);   // permanent
+
+  uint32_t rid = 0x7DF;
+  bool rext = false;
+  int n = probe(0x7DF, false, "bcast11");
+  if (!n) {
+    n = probe(0x7E0, false, "phys7E0");
+    if (n) rid = 0x7E0;
+  }
+  if (!n) {
+    n = probe(0x18DB33F1, true, "bcast29");
+    if (n) { rid = 0x18DB33F1; rext = true; }
+  }
+
+  if (n) {
+    scanMode(0x03, rid, rext);   // stored
+    scanMode(0x07, rid, rext);   // pending
+    scanMode(0x0A, rid, rext);   // permanent
+  } else {
+    Serial.println("# dtc no reply to any probe, code reads skipped");
+  }
+
   canStop();
   if (!canStart(rateIdx, TWAI_MODE_LISTEN_ONLY)) Serial.println("# twai restart failed");
   lastFrameMs = millis();
