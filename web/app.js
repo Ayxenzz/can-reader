@@ -1,5 +1,6 @@
 import { compile, run, show } from './formula.js';
 import { initExtras } from './extras.js';
+import { initRecorder } from './recorder.js';
 
 const $ = (id) => document.getElementById(id);
 const btn = $('btn'), info = $('info'), warn = $('warn'), body = $('body'), head = $('head');
@@ -13,11 +14,12 @@ let t0 = null, endT = null, lastT = 0, minFps = Infinity, lagMs = 0, lagMax = 0;
 let lastByteT = 0, lastFrameT = 0, noData = false, noFrames = false;
 let st = {}, lastUp = -1, reboots = 0, dev = '', idsEarly = 0, earlyDone = false;
 let status = 'Not connected.', port = null, reader = null, busy = false, wake = null;
+let frameTap = null, evTap = null;   // set by recorder.js
 
 // ---- event log, kept across reloads ----
 let logArr = [];
 try { logArr = JSON.parse(localStorage.getItem('canreader.log') || '[]'); } catch (e) {}
-const ev = (m) => { logArr.push(new Date().toTimeString().slice(0, 8) + '  ' + m); if (logArr.length > 300) logArr.shift(); };
+const ev = (m) => { logArr.push(new Date().toTimeString().slice(0, 8) + '  ' + m); if (logArr.length > 300) logArr.shift(); if (evTap) evTap(m); };
 ev('--- page loaded ---');
 setInterval(() => { try { localStorage.setItem('canreader.log', JSON.stringify(logArr.slice(-200))); } catch (e) {} }, 3000);
 $('copy').onclick = async () => {
@@ -150,6 +152,7 @@ function onLine(s) {
   const ts = Number(p[0]), id = parseInt(p[1], 16), ext = p[2], dlc = Number(p[3]), hex = p[4];
   if (p.length !== 5 || isNaN(ts) || isNaN(id) || (ext !== '0' && ext !== '1') ||
       !(dlc >= 0 && dlc <= 8) || hex.length !== dlc * 2 || /[^0-9A-F]/.test(hex)) { bad++; return; }
+  if (frameTap) frameTap(s);
   const key = ext + ':' + id;
   let r = rows.get(key);
   if (!r) {
@@ -340,4 +343,5 @@ btn.onclick = () => { if (reader) reader.cancel(); else connect(); };
 
 rebuildCols();
 initExtras({ getCols: () => cols, setCols: (c) => { cols = c; rebuildCols(); }, setTap: (f) => { tap = f; }, ev });
+initRecorder({ ev, setFrameTap: (f) => { frameTap = f; }, setEvTap: (f) => { evTap = f; } });
 requestAnimationFrame(paint);
