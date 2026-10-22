@@ -5,7 +5,7 @@
 const HEADER = 'ts_us,id,ext,dlc,data\n';
 const MIN_FREE = 30 * 1024 * 1024;
 
-export function initRecorder({ ev, setFrameTap, setEvTap }) {
+export function initRecorder({ ev, setFrameTap, setEvTap, onPlay }) {
   const $ = (id) => document.getElementById(id);
   const p2 = (n) => String(n).padStart(2, '0');
   const size = (b) => (b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB');
@@ -112,7 +112,17 @@ export function initRecorder({ ev, setFrameTap, setEvTap }) {
     if (cur) buf.push('# ' + new Date().toTimeString().slice(0, 8) + ' ' + m + '\n');
   });
 
-  // ---- saving and deleting ----
+  // ---- saving, playing and deleting ----
+  async function blobFor(r) {
+    const db = await dbp;
+    const items = await ask(db.transaction('chunks').objectStore('chunks').getAll(range(r.id)));
+    items.sort((a, b) => a.n - b.n);
+    return new Blob(items.map((x) => x.blob), { type: 'text/csv' });
+  }
+  async function playRec(r) {
+    try { onPlay(await blobFor(r), r.name); }
+    catch (e) { note('Could not read the recording. ' + (e && e.name || e)); }
+  }
   async function save(r) {
     let handle = null;
     if ('showSaveFilePicker' in window) {
@@ -121,12 +131,8 @@ export function initRecorder({ ev, setFrameTap, setEvTap }) {
     }
     note('Preparing ' + r.name + '...');
     let blob;
-    try {
-      const db = await dbp;
-      const items = await ask(db.transaction('chunks').objectStore('chunks').getAll(range(r.id)));
-      items.sort((a, b) => a.n - b.n);
-      blob = new Blob(items.map((x) => x.blob), { type: 'text/csv' });
-    } catch (e) { note('Could not read the recording. ' + (e && e.name || e)); return; }
+    try { blob = await blobFor(r); }
+    catch (e) { note('Could not read the recording. ' + (e && e.name || e)); return; }
     if (handle) {
       try {
         const w = await handle.createWritable();
@@ -175,7 +181,7 @@ export function initRecorder({ ev, setFrameTap, setEvTap }) {
       const t = document.createElement('div');
       const state = r.closed ? '' : cur && cur.id === r.id ? '  recording' : '  interrupted';
       t.textContent = r.name + '  ' + mmss((r.last - r.start) / 1000) + '  ' + r.frames + ' frames  ' + size(r.bytes) + state;
-      div.append(t, mkBtn('Save', () => save(r)), mkBtn('Delete', () => del(r)));
+      div.append(t, mkBtn('Play', () => playRec(r)), mkBtn('Save', () => save(r)), mkBtn('Delete', () => del(r)));
       return div;
     }));
   }
