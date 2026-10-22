@@ -1,13 +1,20 @@
 const KEY = 'canreader.profiles', CUR = 'canreader.profile';
 
-export function initExtras({ getCols, setCols, setTap, ev }) {
+// A profile is { cols, hidden } where hidden lists row keys. Older backups held just the cols array.
+export function initExtras({ getCols, setCols, getHidden, setHidden, setTap, ev }) {
   const $ = (id) => document.getElementById(id);
   const clone = (x) => JSON.parse(JSON.stringify(x));
+  const norm = (p) => (Array.isArray(p)
+    ? { cols: p, hidden: [] }
+    : { cols: Array.isArray(p && p.cols) ? p.cols : [], hidden: Array.isArray(p && p.hidden) ? p.hidden : [] });
   let profiles = {}, cur = 'default';
   try { profiles = JSON.parse(localStorage.getItem(KEY) || '{}'); cur = localStorage.getItem(CUR) || 'default'; } catch (e) {}
-  if (!profiles[cur]) profiles[cur] = clone(getCols());
+  for (const k of Object.keys(profiles)) profiles[k] = norm(profiles[k]);
+  const live = () => ({ cols: clone(getCols()), hidden: [...getHidden()] });
+  if (!profiles[cur]) profiles[cur] = live(); else setHidden(profiles[cur].hidden);
+  const load = (p) => { setCols(clone(p.cols)); setHidden(p.hidden); };
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(profiles)); localStorage.setItem(CUR, cur); } catch (e) {} };
-  const sync = () => { profiles[cur] = clone(getCols()); };
+  const sync = () => { profiles[cur] = live(); };
 
   const add = (html) => {
     const d = document.createElement('details');
@@ -28,16 +35,16 @@ export function initExtras({ getCols, setCols, setTap, ev }) {
   const sel = $('psel'), msg = $('pmsg');
   const fill = () => { sel.replaceChildren(...Object.keys(profiles).map((n) => new Option(n))); sel.value = cur; };
   fill();
-  setInterval(() => { if (JSON.stringify(getCols()) !== JSON.stringify(profiles[cur])) { sync(); save(); } }, 2000);
-  sel.onchange = () => { sync(); cur = sel.value; setCols(clone(profiles[cur])); save(); ev('profile ' + cur); };
+  setInterval(() => { if (JSON.stringify(live()) !== JSON.stringify(profiles[cur])) { sync(); save(); } }, 2000);
+  sel.onchange = () => { sync(); cur = sel.value; load(profiles[cur]); save(); ev('profile ' + cur); };
   $('pnew').onclick = () => {
     const n = (prompt('Profile name') || '').trim();
     if (!n || profiles[n]) return;
-    sync(); cur = n; profiles[n] = []; setCols([]); fill(); save();
+    sync(); cur = n; profiles[n] = { cols: [], hidden: [] }; load(profiles[n]); fill(); save();
   };
   $('pdel').onclick = () => {
     if (Object.keys(profiles).length < 2) { msg.textContent = 'Keep at least one profile.'; return; }
-    delete profiles[cur]; cur = Object.keys(profiles)[0]; setCols(clone(profiles[cur])); fill(); save();
+    delete profiles[cur]; cur = Object.keys(profiles)[0]; load(profiles[cur]); fill(); save();
   };
   $('pexp').onclick = async () => {
     sync();
@@ -48,9 +55,9 @@ export function initExtras({ getCols, setCols, setTap, ev }) {
     try {
       const d = JSON.parse($('pbox').value);
       if (!d || typeof d.profiles !== 'object') throw new Error('not a backup');
-      Object.assign(profiles, d.profiles);
+      for (const [k, v] of Object.entries(d.profiles)) profiles[k] = norm(v);
       if (profiles[d.cur]) cur = d.cur;
-      setCols(clone(profiles[cur])); fill(); save(); msg.textContent = 'Imported.';
+      load(profiles[cur]); fill(); save(); msg.textContent = 'Imported.';
     } catch (e) { msg.textContent = 'Import failed. ' + e.message; }
   };
 
