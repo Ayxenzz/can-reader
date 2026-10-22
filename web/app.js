@@ -1,6 +1,7 @@
 import { compile, run, show } from './formula.js';
 import { initExtras } from './extras.js';
 import { initRecorder } from './recorder.js';
+import { initReplay } from './replay.js';
 
 const $ = (id) => document.getElementById(id);
 const btn = $('btn'), info = $('info'), warn = $('warn'), body = $('body'), head = $('head');
@@ -15,11 +16,12 @@ let lastByteT = 0, lastFrameT = 0, noData = false, noFrames = false;
 let st = {}, lastUp = -1, reboots = 0, dev = '', idsEarly = 0, earlyDone = false;
 let status = 'Not connected.', port = null, reader = null, busy = false, wake = null;
 let frameTap = null, evTap = null;   // set by recorder.js
+let replaying = false, replayApi = null;   // set by replay.js
 
 // ---- event log, kept across reloads ----
 let logArr = [];
 try { logArr = JSON.parse(localStorage.getItem('canreader.log') || '[]'); } catch (e) {}
-const ev = (m) => { logArr.push(new Date().toTimeString().slice(0, 8) + '  ' + m); if (logArr.length > 300) logArr.shift(); if (evTap) evTap(m); };
+const ev = (m) => { if (replaying && !/^(replay|js )/.test(m)) return; logArr.push(new Date().toTimeString().slice(0, 8) + '  ' + m); if (logArr.length > 300) logArr.shift(); if (evTap) evTap(m); };
 ev('--- page loaded ---');
 setInterval(() => { try { localStorage.setItem('canreader.log', JSON.stringify(logArr.slice(-200))); } catch (e) {} }, 3000);
 $('copy').onclick = async () => {
@@ -152,7 +154,7 @@ function onLine(s) {
   const ts = Number(p[0]), id = parseInt(p[1], 16), ext = p[2], dlc = Number(p[3]), hex = p[4];
   if (p.length !== 5 || isNaN(ts) || isNaN(id) || (ext !== '0' && ext !== '1') ||
       !(dlc >= 0 && dlc <= 8) || hex.length !== dlc * 2 || /[^0-9A-F]/.test(hex)) { bad++; return; }
-  if (frameTap) frameTap(s);
+  if (frameTap && !replaying) frameTap(s);
   const key = ext + ':' + id;
   let r = rows.get(key);
   if (!r) {
@@ -240,7 +242,7 @@ setInterval(() => {
   if (live && el > 2) minFps = Math.min(minFps, fps);
   const lostAll = lostAcc + lost;
 
-  if (live) {
+  if (live && !replaying) {
     if (lagMs > 300) ev('stall ' + lagMs.toFixed(0) + ' ms' + (document.hidden ? ' (page hidden)' : ''));
     const gb = t - lastByteT, gf = t - lastFrameT;
     if (gb > 3000 && !noData) { noData = true; ev('no usb data for 3 s'); }
@@ -273,15 +275,7 @@ setInterval(() => {
 }, 1000);
 
 // ---- connection ----
-async function connect(p) {
-  if (busy) return;
-  if (!('serial' in navigator)) { status = 'Web Serial is not available in this browser.'; return; }
-  busy = true;
-  try {
-    port = p || await navigator.serial.requestPort();
-    await port.open({ baudRate: 2000000, bufferSize: 65536 });
-  } catch (e) { status = 'Could not open port. ' + e.message; ev('open failed ' + e.message); port = null; busy = false; return; }
-
+function resetRun() {
   rows.clear(); dirty.clear(); hot.clear(); body.innerHTML = '';   // fresh run
   total = lastTotal = bad = bytes = 0;
   fMark = null; totalMark = 0; lost = 0; lostAcc = 0;
@@ -289,6 +283,19 @@ async function connect(p) {
   lagMs = 0; lagMax = 0; noData = noFrames = false; idsEarly = 0; earlyDone = false;
   for (const k in prevs) delete prevs[k];
   t0 = performance.now(); lastT = t0; endT = null; minFps = Infinity; lastByteT = t0; lastFrameT = t0;
+}
+
+async function connect(p) {
+  if (busy) return;
+  if (replaying && replayApi) replayApi.stop();
+  if (!('serial' in navigator)) { status = 'Web Serial is not available in this browser.'; return; }
+  busy = true;
+  try {
+    port = p || await navigator.serial.requestPort();
+    await port.open({ baudRate: 2000000, bufferSize: 65536 });
+  } catch (e) { status = 'Could not open port. ' + e.message; ev('open failed ' + e.message); port = null; busy = false; return; }
+
+  resetRun();
 
   ev('connected' + (p ? ' (auto)' : ''));
   status = 'Connected.';
@@ -343,5 +350,17 @@ btn.onclick = () => { if (reader) reader.cancel(); else connect(); };
 
 rebuildCols();
 initExtras({ getCols: () => cols, setCols: (c) => { cols = c; rebuildCols(); }, setTap: (f) => { tap = f; }, ev });
-initRecorder({ ev, setFrameTap: (f) => { frameTap = f; }, setEvTap: (f) => { evTap = f; } });
+initRecorder({ ev, setFrameTap: (f) => { frameTap = f; }, setEvTap: (f) => { evTap = f; }, onPlay: (b, n) => replayApi && replayApi.play(b, n) });
+replayApi = initReplay({
+  ev,
+  isLive: () => reader !== null,
+  begin: (name) => { replaying = true; resetRun(); status = 'Replaying ' + name + '.'; },
+  end: (why) => { replaying = false; endT = performance.now(); status = 'Replay ' + why + '.'; },
+  feed: (s) => {
+    if (s[0] === '#') { dev = s; return; }   // notes from the recording, shown but not logged
+    bytes += s.length + 1;
+    lastByteT = performance.now();
+    onLine(s);
+  },
+});
 requestAnimationFrame(paint);
