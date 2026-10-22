@@ -2,6 +2,7 @@ import { compile, run, show } from './formula.js';
 import { initExtras } from './extras.js';
 import { initRecorder } from './recorder.js';
 import { initReplay } from './replay.js';
+import { initRows } from './rows.js';
 
 const $ = (id) => document.getElementById(id);
 const btn = $('btn'), info = $('info'), warn = $('warn'), body = $('body'), head = $('head');
@@ -17,6 +18,7 @@ let st = {}, lastUp = -1, reboots = 0, dev = '', idsEarly = 0, earlyDone = false
 let status = 'Not connected.', port = null, reader = null, busy = false, wake = null;
 let frameTap = null, evTap = null;   // set by recorder.js
 let replaying = false, replayApi = null;   // set by replay.js
+let rowsApi = null;   // set by rows.js
 
 // ---- event log, kept across reloads ----
 let logArr = [];
@@ -50,6 +52,8 @@ let cols = [];
 try { cols = JSON.parse(localStorage.getItem('canreader.cols') || '[]'); } catch (e) {}
 let tap = null;   // set by extras.js, called when a byte changes
 const compiled = new Map();
+const cbox = document.createElement('div');   // hide and show buttons for columns
+$('clist').after(cbox);
 function fnFor(src) {
   if (!compiled.has(src)) { try { compiled.set(src, compile(src)); } catch (e) { compiled.set(src, e); } }
   return compiled.get(src);
@@ -87,14 +91,20 @@ function drawUser(r) {
 
 function userCells(r) {
   (r.ux || []).forEach((td) => td.remove());
-  r.ux = cols.map(() => { const td = document.createElement('td'); td._t = ''; r.tr.appendChild(td); return td; });
+  r.ux = cols.map((c) => { const td = document.createElement('td'); td._t = ''; if (c.hidden) td.style.display = 'none'; r.tr.appendChild(td); return td; });
   dirty.add(r);
 }
 
 function rebuildCols() {
   head.querySelectorAll('.uh').forEach((e) => e.remove());
-  cols.forEach((c) => { const th = document.createElement('th'); th.className = 'uh'; th.textContent = c.name; head.appendChild(th); });
+  cols.forEach((c) => { const th = document.createElement('th'); th.className = 'uh'; th.textContent = c.name; if (c.hidden) th.style.display = 'none'; head.appendChild(th); });
   for (const r of rows.values()) if (r.tr) userCells(r);
+  cbox.replaceChildren(...cols.map((c) => {
+    const b = document.createElement('button');
+    b.textContent = (c.hidden ? 'Show ' : 'Hide ') + c.name;
+    b.onclick = () => { c.hidden = !c.hidden; rebuildCols(); };   // a hidden column still computes
+    return b;
+  }));
   $('clist').textContent = cols.map((c) => c.name + ' = ' + (c.formula || '(rows below only)') +
     Object.keys(c.cells).map((k) => '\n   ' + k + ': ' + c.cells[k]).join('')).join('\n') || 'No columns yet.';
   try { localStorage.setItem('canreader.cols', JSON.stringify(cols)); } catch (e) {}
@@ -158,10 +168,10 @@ function onLine(s) {
   const key = ext + ':' + id;
   let r = rows.get(key);
   if (!r) {
-    r = { id, ext, hex: p[1].toUpperCase(), count: 0, ts: 0, period: 0, dlc: 0, bytes: [], chg: [], tr: null, c: null, ux: [] };
+    r = { id, ext, hex: p[1].toUpperCase(), key: p[1].toUpperCase() + (ext === '1' ? 'x' : ''), nchg: 0, fresh: false, hidden: false, count: 0, ts: 0, period: 0, dlc: 0, bytes: [], chg: [], tr: null, c: null, ux: [] };
     rows.set(key, r);
     needSort = true;
-    if (performance.now() - t0 < 5000) idsEarly++; else ev('new id ' + p[1]);
+    if (performance.now() - t0 < 5000) idsEarly++; else { ev('new id ' + p[1]); r.fresh = !replaying; }
   }
   r.count++;
   if (r.ts) r.period = (ts - r.ts) / 1000;
@@ -169,7 +179,7 @@ function onLine(s) {
   r.dlc = dlc;
   for (let i = 0; i < dlc; i++) {
     const v = parseInt(hex.substr(i * 2, 2), 16);
-    if (r.bytes[i] !== undefined && r.bytes[i] !== v) { r.chg[i] = true; if (tap) tap(r, i, r.bytes[i] ^ v); }
+    if (r.bytes[i] !== undefined && r.bytes[i] !== v) { r.chg[i] = true; r.nchg++; if (tap) tap(r, i, r.bytes[i] ^ v); }
     r.bytes[i] = v;
   }
   r.bytes.length = dlc;
@@ -195,6 +205,7 @@ function makeRow(r) {
   r.tr = tr;
   r.c = { count, period, spans };
   userCells(r);
+  if (rowsApi) rowsApi.place(r);
 }
 
 function paint() {
@@ -206,6 +217,7 @@ function paint() {
     needSort = false;
   }
   for (const r of dirty) {
+    if (r.hidden) continue;   // redrawn from memory when it is shown again
     r.c.count.textContent = r.count;
     r.c.period.textContent = r.period ? r.period.toFixed(1) : '';
     for (let i = 0; i < 8; i++) {
@@ -283,6 +295,7 @@ function resetRun() {
   lagMs = 0; lagMax = 0; noData = noFrames = false; idsEarly = 0; earlyDone = false;
   for (const k in prevs) delete prevs[k];
   t0 = performance.now(); lastT = t0; endT = null; minFps = Infinity; lastByteT = t0; lastFrameT = t0;
+  if (rowsApi) rowsApi.reset();
 }
 
 async function connect(p) {
@@ -349,7 +362,12 @@ if ('serial' in navigator) {
 btn.onclick = () => { if (reader) reader.cancel(); else connect(); };
 
 rebuildCols();
-initExtras({ getCols: () => cols, setCols: (c) => { cols = c; rebuildCols(); }, setTap: (f) => { tap = f; }, ev });
+rowsApi = initRows({ rows, redraw: (r) => dirty.add(r) });
+initExtras({
+  getCols: () => cols, setCols: (c) => { cols = c; rebuildCols(); },
+  getHidden: () => rowsApi.getHidden(), setHidden: (h) => rowsApi.setHidden(h),
+  setTap: (f) => { tap = f; }, ev,
+});
 initRecorder({ ev, setFrameTap: (f) => { frameTap = f; }, setEvTap: (f) => { evTap = f; }, onPlay: (b, n) => replayApi && replayApi.play(b, n) });
 replayApi = initReplay({
   ev,
