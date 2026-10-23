@@ -3,6 +3,7 @@ import { initExtras } from './extras.js';
 import { initRecorder } from './recorder.js';
 import { initReplay } from './replay.js';
 import { initRows } from './rows.js';
+import { initCells } from './cells.js';
 
 const $ = (id) => document.getElementById(id);
 const btn = $('btn'), info = $('info'), warn = $('warn'), body = $('body'), head = $('head');
@@ -59,23 +60,30 @@ function fnFor(src) {
   return compiled.get(src);
 }
 
+function evalSrc(r, src, cache, stack) {
+  const f = fnFor(src);
+  if (f instanceof Error) throw f;
+  return run(f, r, (n) => {
+    const o = cols.find((x) => x.name.toLowerCase() === n);
+    if (!o) throw new Error('no column ' + n);
+    return evalCol(r, o, cache, stack).v;
+  });
+}
+
 function evalCol(r, c, cache, stack) {
   if (cache[c.name]) return cache[c.name];
   if (stack.has(c.name)) throw new Error('cycle at ' + c.name);
   stack.add(c.name);
   const src = r.hex in c.cells ? c.cells[r.hex] : c.formula;
-  let res = { v: NaN, f: null };
-  if (src) {
-    const f = fnFor(src);
-    if (f instanceof Error) throw f;
-    res = run(f, r, (n) => {
-      const o = cols.find((x) => x.name.toLowerCase() === n);
-      if (!o) throw new Error('no column ' + n);
-      return evalCol(r, o, cache, stack).v;
-    });
-  }
+  const res = src ? evalSrc(r, src, cache, stack) : { v: NaN, f: null };
   stack.delete(c.name);
   return (cache[c.name] = res);
+}
+
+// What a formula gives for this row right now, used by the edit sheet.
+function previewCell(r, src) {
+  try { const x = evalSrc(r, src, {}, new Set()); return show(x.v, x.f) || '(blank)'; }
+  catch (e) { return 'error: ' + e.message; }
 }
 
 function drawUser(r) {
@@ -83,7 +91,12 @@ function drawUser(r) {
   cols.forEach((c, i) => {
     const td = r.ux[i];
     let t = '', tip = '';
-    try { const x = evalCol(r, c, cache, new Set()); t = show(x.v, x.f); }
+    try {
+      const x = evalCol(r, c, cache, new Set());
+      t = show(x.v, x.f);
+      const lab = c.labels && c.labels[r.hex];
+      if (lab && t !== '') t = lab + ' ' + t;   // optional label such as speed
+    }
     catch (e) { t = 'err'; tip = e.message; }
     if (td._t !== t) { td.textContent = t; td._t = t; td.title = tip; }
   });
@@ -91,13 +104,28 @@ function drawUser(r) {
 
 function userCells(r) {
   (r.ux || []).forEach((td) => td.remove());
-  r.ux = cols.map((c) => { const td = document.createElement('td'); td._t = ''; if (c.hidden) td.style.display = 'none'; r.tr.appendChild(td); return td; });
+  r.ux = cols.map((c, i) => {
+    const td = document.createElement('td');
+    td._t = ''; td._ci = i;
+    td.style.minWidth = '6ch'; td.style.cursor = 'pointer';
+    if (c.hidden) td.style.display = 'none';
+    r.tr.appendChild(td);
+    return td;
+  });
   dirty.add(r);
 }
 
 function rebuildCols() {
   head.querySelectorAll('.uh').forEach((e) => e.remove());
-  cols.forEach((c) => { const th = document.createElement('th'); th.className = 'uh'; th.textContent = c.name; if (c.hidden) th.style.display = 'none'; head.appendChild(th); });
+  cols.forEach((c, i) => {
+    const th = document.createElement('th');
+    th.className = 'uh'; th.textContent = c.name; th._ci = i; th.style.cursor = 'pointer';
+    if (c.hidden) th.style.display = 'none';
+    head.appendChild(th);
+  });
+  const plus = document.createElement('th');   // tap to add a column
+  plus.className = 'uh'; plus.textContent = '+'; plus._plus = true; plus.style.cursor = 'pointer';
+  head.appendChild(plus);
   for (const r of rows.values()) if (r.tr) userCells(r);
   cbox.replaceChildren(...cols.map((c) => {
     const b = document.createElement('button');
@@ -118,8 +146,7 @@ $('cadd').onclick = () => {
   if (f) { const x = fnFor(f); if (x instanceof Error) { msg.textContent = x.message; return; } }
   let c = cols.find((x) => x.name.toLowerCase() === name.toLowerCase());
   if (!c) {
-    if (!f) { msg.textContent = 'No such column.'; return; }
-    c = { name, formula: '', cells: {} };
+    c = { name, formula: '', cells: {}, labels: {} };
     cols.push(c);
   }
   if (rid) { if (f) c.cells[rid] = f; else delete c.cells[rid]; }
@@ -367,6 +394,10 @@ initExtras({
   getCols: () => cols, setCols: (c) => { cols = c; rebuildCols(); },
   getHidden: () => rowsApi.getHidden(), setHidden: (h) => rowsApi.setHidden(h), showOnly: (k) => rowsApi.showOnly(k),
   setTap: (f) => { tap = f; }, ev,
+});
+initCells({
+  getCols: () => cols, rebuild: rebuildCols, preview: previewCell,
+  check: (s) => { const x = fnFor(s); return x instanceof Error ? x.message : ''; },
 });
 initRecorder({ ev, setFrameTap: (f) => { frameTap = f; }, setEvTap: (f) => { evTap = f; }, onPlay: (b, n) => replayApi && replayApi.play(b, n) });
 replayApi = initReplay({
