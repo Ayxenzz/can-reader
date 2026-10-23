@@ -1,7 +1,7 @@
 const KEY = 'canreader.profiles', CUR = 'canreader.profile';
 
 // A profile is { cols, hidden } where hidden lists row keys. Older backups held just the cols array.
-export function initExtras({ getCols, setCols, getHidden, setHidden, setTap, ev }) {
+export function initExtras({ getCols, setCols, getHidden, setHidden, showOnly, setTap, ev }) {
   const $ = (id) => document.getElementById(id);
   const clone = (x) => JSON.parse(JSON.stringify(x));
   const norm = (p) => (Array.isArray(p)
@@ -28,7 +28,8 @@ export function initExtras({ getCols, setCols, getHidden, setHidden, setTap, ev 
     <button id="pimp">Import</button><span id="pmsg"></span>`);
   add(`<summary>Diff</summary>
     <button id="dn">Record noise</button><button id="da">Record action</button><button id="dc">Clear</button>
-    <pre>Record noise with nothing touched, then record the action. Bits that changed only during the action are listed.</pre>
+    <button id="dshow">Show only changed rows</button>
+    <pre>Record noise with nothing touched, 20 seconds or more, in the same ignition state. Then record the action. Bits that changed only during the action are listed, and counters and checksums drop out because they also changed during the noise.</pre>
     <pre id="dout"></pre>`);
 
   // ---- profiles ----
@@ -70,11 +71,13 @@ export function initExtras({ getCols, setCols, getHidden, setHidden, setTap, ev 
     m.set(k, (m.get(k) || 0) | x);
   });
   const labels = { noise: 'Record noise', action: 'Record action' };
+  let diffKeys = new Set();
   const show = () => {
     const out = [];
+    diffKeys = new Set();
     for (const [k, m] of rec.action) {
       const d = m & ~(rec.noise.get(k) || 0) & 255;
-      if (d) out.push(k + '  0x' + d.toString(16).toUpperCase().padStart(2, '0') + '  ' + d.toString(2).padStart(8, '0'));
+      if (d) { out.push(k + '  0x' + d.toString(16).toUpperCase().padStart(2, '0') + '  ' + d.toString(2).padStart(8, '0')); diffKeys.add(k.split(' ')[0]); }
     }
     out.sort();
     $('dout').textContent = (out.join('\n') || 'No bits changed beyond the noise.') +
@@ -88,5 +91,9 @@ export function initExtras({ getCols, setCols, getHidden, setHidden, setTap, ev 
   };
   $('dn').onclick = () => toggle('noise', 'dn');
   $('da').onclick = () => toggle('action', 'da');
-  $('dc').onclick = () => { mode = null; rec.noise.clear(); rec.action.clear(); $('dout').textContent = ''; $('dn').textContent = labels.noise; $('da').textContent = labels.action; };
+  $('dshow').onclick = () => {
+    if (!diffKeys.size) { $('dout').textContent = 'Record noise, then an action, first. No rows changed beyond the noise.'; return; }
+    showOnly([...diffKeys]);
+  };
+  $('dc').onclick = () => { mode = null; diffKeys = new Set(); rec.noise.clear(); rec.action.clear(); $('dout').textContent = ''; $('dn').textContent = labels.noise; $('da').textContent = labels.action; };
 }
