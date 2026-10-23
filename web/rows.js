@@ -3,12 +3,11 @@
 // shows by default and flashes its ID, because a new ID is often the signal you are hunting.
 export function initRows({ rows, redraw }) {
   const $ = (id) => document.getElementById(id);
-  let hidden = new Set(), solo = null, filter = null, marks = new Map(), note = '';
+  let hidden = new Set(), solo = null, filter = null, note = '';
 
   const det = document.createElement('details');
   det.innerHTML = `<summary id="rowsum">Rows</summary>
     <input id="rowfilter" placeholder="filter, for example 164 17C 100-1FF">
-    <button id="rowmark">Mark</button><button id="rowunch">Hide unchanged</button>
     <button id="rowhall">Hide all</button><button id="rowsall">Show all</button><button id="rowsolo">Clear solo</button>
     <pre id="rowinfo"></pre><div id="rowhid"></div>`;
   $('logbox').before(det);
@@ -94,21 +93,6 @@ export function initRows({ rows, redraw }) {
   $('rowhall').onclick = () => { for (const r of rows.values()) hidden.add(r.key); note = ''; apply(); };
   $('rowsall').onclick = () => { hidden.clear(); solo = null; note = ''; apply(); };
   $('rowsolo').onclick = () => { solo = null; apply(); };
-  $('rowmark').onclick = () => {
-    marks.clear();
-    for (const r of rows.values()) marks.set(r.key, r.nchg);
-    note = 'Marked ' + marks.size + ' rows. Do the action, then press Hide unchanged.';
-    text();
-  };
-  $('rowunch').onclick = () => {
-    if (!marks.size) { note = 'Press Mark first.'; text(); return; }
-    let n = 0;
-    for (const r of rows.values()) {
-      if (marks.has(r.key) && marks.get(r.key) === r.nchg && !hidden.has(r.key)) { hidden.add(r.key); n++; }
-    }
-    note = 'Hid ' + n + ' unchanged rows.';
-    apply();
-  };
   setInterval(text, 1000);
   text();
 
@@ -116,6 +100,13 @@ export function initRows({ rows, redraw }) {
     place,
     getHidden: () => [...hidden].sort(),
     setHidden: (a) => { hidden = new Set(a); apply(); },
-    reset: () => { marks.clear(); solo = null; note = ''; },
+    // Keeps only the given row keys visible, used by the diff tool.
+    showOnly: (keys) => {
+      const keep = new Set(keys);
+      for (const r of rows.values()) { if (keep.has(r.key)) hidden.delete(r.key); else hidden.add(r.key); }
+      note = 'Showing only the ' + keep.size + ' rows from the diff.';
+      apply();
+    },
+    reset: () => { solo = null; note = ''; },
   };
 }
