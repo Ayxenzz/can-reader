@@ -27,17 +27,18 @@ export function initReplay({ ev, begin, end, feed, isLive }) {
       <option value="2">2x</option><option value="5">5x</option><option value="10">10x</option><option value="0">max</option>
     </select>
     <label><input type="checkbox" id="rloop" style="width:auto;margin:0 6px 0 0">Loop</label><br>
+    <input type="range" id="rseek" min="0" max="1000" value="0" style="width:100%">
     <button id="rpause">Pause</button><button id="rrestart">Restart</button><button id="rstop">Stop</button>
     <pre id="rprog">No replay. Pick a file, or press Play on a recording.</pre>`;
   $('logbox').before(det);
 
   let src = null, blob = null, name = '', paused = false, vt = 0, lastTs = 0, firstTs = 0, first = true;
-  let consumed = 0, fed = 0, timer = 0, busy = false, lastWall = 0, lastProg = 0;
+  let consumed = 0, fed = 0, timer = 0, busy = false, lastWall = 0, lastProg = 0, seekTo = -1, resync = false;
   const say = (m) => { $('rprog').textContent = m; };
 
   function open() {
     src = new Source(blob);
-    first = true; paused = false; vt = 0; lastTs = 0; consumed = 0; fed = 0;
+    first = true; paused = false; vt = 0; lastTs = 0; consumed = 0; fed = 0; seekTo = -1; resync = false;
     lastWall = performance.now();
     $('rpause').textContent = 'Pause';
   }
@@ -70,9 +71,12 @@ export function initReplay({ ev, begin, end, feed, isLive }) {
   }
 
   function advance(dtWall, speed, started) {
-    if (speed > 0) vt += dtWall * 1000 * speed;   // microseconds of recording time
+    if (speed > 0 && seekTo < 0) vt += dtWall * 1000 * speed;   // microseconds of recording time
     let n = 0;
+    const budget = seekTo >= 0 ? 30 : 10;   // fast-forwarding may use more of each tick
     for (;;) {
+      if (seekTo >= 0 && consumed >= seekTo) { seekTo = -1; resync = true; }   // arrived, back to normal pace
+      const sp = seekTo >= 0 ? 0 : speed;
       if (src.qi >= src.q.length) break;
       const line = src.q[src.qi];
       if (!line) { src.qi++; consumed++; continue; }
@@ -81,15 +85,16 @@ export function initReplay({ ev, begin, end, feed, isLive }) {
       const c = line.indexOf(',');
       const ts = Number(line.slice(0, c));
       if (!(ts >= 0)) { src.qi++; consumed += len; continue; }                              // header row
-      if (first) { first = false; vt = ts; firstTs = ts; }
-      if (speed > 0) {
+      if (first) { first = false; firstTs = ts; vt = ts; }
+      if (resync) { resync = false; vt = ts; }
+      if (sp > 0) {
         if (ts > vt + GAP) vt = ts;                // skip long idle gaps
         else if (ts < lastTs - GAP) vt = ts;       // timestamps restarted
         if (ts > vt) break;                        // not due yet
       }
       feed(line);
       fed++; lastTs = ts; consumed += len; src.qi++;
-      if (++n % 200 === 0 && performance.now() - started > 10) break;   // keep the page responsive
+      if (++n % 200 === 0 && performance.now() - started > budget) break;   // keep the page responsive
     }
     if (src.qi >= src.q.length && src.eof) finish();
   }
@@ -108,8 +113,10 @@ export function initReplay({ ev, begin, end, feed, isLive }) {
       }
       if (src && t - lastProg > 250) {
         lastProg = t;
-        say(name + (paused ? '  paused' : '') + '  ' + Math.min(100, consumed / Math.max(blob.size, 1) * 100).toFixed(0) + '%  ' +
+        const pct = Math.min(100, consumed / Math.max(blob.size, 1) * 100);
+        say(name + (seekTo >= 0 ? '  seeking' : paused ? '  paused' : '') + '  ' + pct.toFixed(0) + '%  ' +
             fed + ' frames  ' + (first ? 0 : (lastTs - firstTs) / 1e6).toFixed(1) + ' s');
+        if (seekTo < 0 && document.activeElement !== $('rseek')) $('rseek').value = Math.round(pct * 10);
       }
     } catch (e) {
       ev('replay error ' + (e && e.name || e));
@@ -118,6 +125,19 @@ export function initReplay({ ev, begin, end, feed, isLive }) {
     busy = false;
   }
 
+  // Seeking forward replays the skipped part at full speed so the table is correct when it arrives.
+  // Seeking backward starts over and fast-forwards to the target.
+  function seek(bytes) {
+    if (!blob || !src) return;
+    if (bytes < consumed) {
+      stopTimer();
+      open();
+      begin(name);
+      timer = setInterval(tick, 20);
+    }
+    seekTo = bytes;
+  }
+  $('rseek').oninput = () => { if (blob && src) seek(Number($('rseek').value) / 1000 * blob.size); };
   $('rfile').onchange = () => { const f = $('rfile').files[0]; if (f) play(f, f.name); };
   $('rpause').onclick = () => { if (!src) return; paused = !paused; $('rpause').textContent = paused ? 'Resume' : 'Pause'; };
   $('rrestart').onclick = () => { if (blob) play(blob, name); };
