@@ -1,18 +1,21 @@
 const KEY = 'canreader.profiles', CUR = 'canreader.profile';
 
-// A profile is { cols, hidden } where hidden lists row keys. Older backups held just the cols array.
-export function initExtras({ getCols, setCols, getHidden, setHidden, showOnly, setTap, ev }) {
+// A profile is { cols, hidden, view } where hidden lists row keys and view holds hidden and muted columns
+// and cells. Older backups held just the cols array.
+export function initExtras({ getCols, setCols, getHidden, setHidden, getView, setView, showOnly, setTap, ev }) {
   const $ = (id) => document.getElementById(id);
   const clone = (x) => JSON.parse(JSON.stringify(x));
+  const list = (a) => (Array.isArray(a) ? a : []);
+  const normView = (v) => ({ hide: list(v && v.hide), mute: list(v && v.mute), cells: list(v && v.cells) });
   const norm = (p) => (Array.isArray(p)
-    ? { cols: p, hidden: [] }
-    : { cols: Array.isArray(p && p.cols) ? p.cols : [], hidden: Array.isArray(p && p.hidden) ? p.hidden : [] });
+    ? { cols: p, hidden: [], view: normView() }
+    : { cols: list(p && p.cols), hidden: list(p && p.hidden), view: normView(p && p.view) });
   let profiles = {}, cur = 'default';
   try { profiles = JSON.parse(localStorage.getItem(KEY) || '{}'); cur = localStorage.getItem(CUR) || 'default'; } catch (e) {}
   for (const k of Object.keys(profiles)) profiles[k] = norm(profiles[k]);
-  const live = () => ({ cols: clone(getCols()), hidden: [...getHidden()] });
-  if (!profiles[cur]) profiles[cur] = live(); else setHidden(profiles[cur].hidden);
-  const load = (p) => { setCols(clone(p.cols)); setHidden(p.hidden); };
+  const live = () => ({ cols: clone(getCols()), hidden: [...getHidden()], view: clone(getView()) });
+  if (!profiles[cur]) profiles[cur] = live(); else { setHidden(profiles[cur].hidden); setView(profiles[cur].view); }
+  const load = (p) => { setCols(clone(p.cols)); setHidden(p.hidden); setView(p.view); };
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(profiles)); localStorage.setItem(CUR, cur); } catch (e) {} };
   const sync = () => { profiles[cur] = live(); };
 
@@ -41,7 +44,7 @@ export function initExtras({ getCols, setCols, getHidden, setHidden, showOnly, s
   $('pnew').onclick = () => {
     const n = (prompt('Profile name') || '').trim();
     if (!n || profiles[n]) return;
-    sync(); cur = n; profiles[n] = { cols: [], hidden: [] }; load(profiles[n]); fill(); save();
+    sync(); cur = n; profiles[n] = { cols: [], hidden: [], view: normView() }; load(profiles[n]); fill(); save();
   };
   $('pdel').onclick = () => {
     if (Object.keys(profiles).length < 2) { msg.textContent = 'Keep at least one profile.'; return; }
