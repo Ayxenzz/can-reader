@@ -4,6 +4,7 @@ import { initRecorder } from './recorder.js';
 import { initReplay } from './replay.js';
 import { initRows } from './rows.js';
 import { initCells } from './cells.js';
+import { initView } from './view.js';
 
 const $ = (id) => document.getElementById(id);
 const btn = $('btn'), info = $('info'), warn = $('warn'), body = $('body'), head = $('head');
@@ -19,7 +20,7 @@ let st = {}, lastUp = -1, reboots = 0, dev = '', idsEarly = 0, earlyDone = false
 let status = 'Not connected.', port = null, reader = null, busy = false, wake = null;
 let frameTap = null, evTap = null;   // set by recorder.js
 let replaying = false, replayApi = null;   // set by replay.js
-let rowsApi = null;   // set by rows.js
+let rowsApi = null, viewApi = null;   // set by rows.js and view.js
 
 // ---- event log, kept across reloads ----
 let logArr = [];
@@ -195,7 +196,7 @@ function onLine(s) {
   const key = ext + ':' + id;
   let r = rows.get(key);
   if (!r) {
-    r = { id, ext, hex: p[1].toUpperCase(), key: p[1].toUpperCase() + (ext === '1' ? 'x' : ''), fresh: false, hidden: false, count: 0, ts: 0, period: 0, dlc: 0, bytes: [], chg: [], tr: null, c: null, ux: [] };
+    r = { id, ext, hex: p[1].toUpperCase(), key: p[1].toUpperCase() + (ext === '1' ? 'x' : ''), mute: [], fresh: false, hidden: false, count: 0, ts: 0, period: 0, dlc: 0, bytes: [], chg: [], tr: null, c: null, ux: [] };
     rows.set(key, r);
     needSort = true;
     if (performance.now() - t0 < 5000) idsEarly++; else { ev('new id ' + p[1]); r.fresh = !replaying; }
@@ -206,7 +207,7 @@ function onLine(s) {
   r.dlc = dlc;
   for (let i = 0; i < dlc; i++) {
     const v = parseInt(hex.substr(i * 2, 2), 16);
-    if (r.bytes[i] !== undefined && r.bytes[i] !== v) { r.chg[i] = true; if (tap) tap(r, i, r.bytes[i] ^ v); }
+    if (r.bytes[i] !== undefined && r.bytes[i] !== v && !r.mute[i]) { r.chg[i] = true; if (tap) tap(r, i, r.bytes[i] ^ v); }   // muted cells neither flash nor count for the diff
     r.bytes[i] = v;
   }
   r.bytes.length = dlc;
@@ -220,19 +221,14 @@ function makeRow(r) {
   const tr = document.createElement('tr');
   const mk = (txt, cls) => { const td = document.createElement('td'); if (cls) td.className = cls; td.textContent = txt; tr.appendChild(td); return td; };
   mk(r.id.toString(16).toUpperCase().padStart(r.ext === '1' ? 8 : 3, '0'));   // 8 digits = 29-bit, 3 = 11-bit
-  const count = mk('', 'n'), period = mk('', 'n'), data = mk('');
-  const spans = [];
-  for (let i = 0; i < 8; i++) {
-    const sp = document.createElement('span');
-    sp.className = 'b';
-    sp._t = '';
-    data.appendChild(sp);
-    spans.push(sp);
-  }
+  const count = mk('', 'n'), period = mk('', 'n');
+  const spans = [];   // one cell per data byte
+  for (let i = 0; i < 8; i++) { const td = mk('', 'b'); td._t = ''; td._b = i; spans.push(td); }
   r.tr = tr;
   r.c = { count, period, spans };
   userCells(r);
   if (rowsApi) rowsApi.place(r);
+  if (viewApi) viewApi.place(r);
 }
 
 function paint() {
@@ -388,11 +384,13 @@ if ('serial' in navigator) {
 }
 btn.onclick = () => { if (reader) reader.cancel(); else connect(); };
 
+viewApi = initView({ rows });   // builds the built-in header cells, so it runs before the user columns
 rebuildCols();
 rowsApi = initRows({ rows, redraw: (r) => dirty.add(r) });
 initExtras({
   getCols: () => cols, setCols: (c) => { cols = c; rebuildCols(); },
   getHidden: () => rowsApi.getHidden(), setHidden: (h) => rowsApi.setHidden(h), showOnly: (k) => rowsApi.showOnly(k),
+  getView: () => viewApi.getView(), setView: (v) => viewApi.setView(v),
   setTap: (f) => { tap = f; }, ev,
 });
 initCells({
