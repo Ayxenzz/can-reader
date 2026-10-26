@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAN probe</title>
+<style>
+  :root { color-scheme: light dark; font: 14px system-ui, sans-serif; }
+  body { margin: 0; padding: 12px; }
+  button { padding: 10px 16px; font-size: 15px; margin: 0 6px 6px 0; }
+  pre { margin: 8px 0; font: 12px ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; }
+  #warn { color: #e5484d; font-weight: bold; }
+</style>
+</head>
+<body>
+<button id="btn">Connect</button><button id="run" disabled>Run probe</button><button id="copy">Copy results</button><button id="clear">Clear</button>
+<pre id="status">Not connected. Close the viewer page first, because only one page can use the board at a time.</pre>
+<pre id="warn"></pre>
+<pre id="sum"></pre>
+<pre id="out"></pre>
+<script>
+const $ = (id) => document.getElementById(id);
+let port = null, reader = null, lines = [], frames = 0, state = '', rate = '', busy = false;
+let running = false, last = '', timer = 0, msg = 'Not connected. Close the viewer page first, because only one page can use the board at a time.';
+
+// summarize start
+// One line per ECU, counting how many requests were answered, refused or ignored.
+function summarize(lines) {
+  const ecus = new Map();
+  const get = (a) => { if (!ecus.has(a)) ecus.set(a, { present: null, std: [0, 0, 0, 0], honda: [0, 0, 0, 0] }); return ecus.get(a); };
+  const idx = { ok: 0, neg: 1, none: 2, bad: 3 };
+  for (const l of lines) {
+    let m = /^# probe ([0-9A-F]{2}) (present|absent)$/.exec(l);
+    if (m) { get(m[1]).present = m[2] === 'present'; continue; }
+    m = /^# probe ([0-9A-F]{2}) ([0-9A-F]{4,6}) (ok|neg|none|bad)\b/.exec(l);
+    if (!m) continue;
+    (m[2].length === 6 ? get(m[1]).honda : get(m[1]).std)[idx[m[3]]]++;
+  }
+  const part = (label, c) => (c[0] + c[1] + c[2] + c[3] ? label + ' ' + c[0] + ' answered, ' + c[1] + ' refused, ' + c[2] + ' silent' + (c[3] ? ', ' + c[3] + ' odd' : '') : '');
+  const out = [];
+  for (const [a, e] of [...ecus].sort()) {
+    const state = e.present === null ? 'answers standard OBD' : e.present ? 'present' : 'absent';
+    out.push('ECU ' + a + ' ' + state + [part('standard', e.std), part('Honda', e.honda)].filter(Boolean).map((p) => '\n   ' + p).join(''));
+  }
+  return out.join('\n');
+}
+// summarize end
+
+function render() {
+  timer = 0;
+  $('status').textContent = msg + (port ? '   rate ' + rate + '  ' + state + '  frames seen ' + frames : '') + (last ? '\n' + last : '');
+  $('run').disabled = !port || running;
+  $('sum').textContent = lines.length ? summarize(lines) : '';
+  $('out').textContent = lines.slice(-25).join('\n');
+}
+const later = () => { if (!timer) timer = setTimeout(render, 250); };
+
+function onLine(s) {
+  if (s.startsWith('# probe')) {
+    lines.push(s);
+    last = s;
+    if (/^# probe (start|queued)/.test(s)) running = true;
+    if (/^# probe (done|aborted|refused|cannot|restart)/.test(s)) running = false;
+    if (/^# probe aborted/.test(s)) $('warn').textContent = 'The probe stopped early because of bus errors. Check the wiring and try again.';
+    later();
+  } else if (s.startsWith('# stat ')) {
+    const m = /state=(\S+)/.exec(s), r = /rate=(\S+)/.exec(s);
+    if (m) state = m[1];
+    if (r) rate = r[1];
+    later();
+  } else if (s[0] !== '#') {
+    frames++;
+    if ((frames & 255) === 0) later();
+  }
+}
+
+async function open(p) {
+  if (busy) return;
+  busy = true;
+  try { port = p; await port.open({ baudRate: 2000000, bufferSize: 65536 }); }
+  catch (e) { msg = 'Could not open the port. ' + e.message; port = null; busy = false; render(); return; }
+  msg = 'Connected.';
+  $('btn').textContent = 'Disconnect';
+  render();
+  const dec = new TextDecoder();
+  let buf = '', first = true;
+  reader = port.readable.getReader();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (first) { first = false; continue; }   // the first piece may be cut off
+        if (line) onLine(line);
+      }
+      if (buf.length > 1000) buf = '';
+    }
+  } catch (e) { msg = 'Read error. ' + e.message; }
+  finally {
+    try { reader.releaseLock(); await port.close(); } catch (e) {}
+    reader = null; port = null; busy = false; running = false;
+    $('btn').textContent = 'Connect';
+    if (msg === 'Connected.') msg = 'Disconnected.';
+    render();
+  }
+}
+
+async function send(text) {
+  const w = port.writable.getWriter();
+  try { await w.write(new TextEncoder().encode(text)); } finally { w.releaseLock(); }
+}
+
+$('btn').onclick = async () => {
+  if (reader) { reader.cancel(); return; }
+  if (!('serial' in navigator)) { msg = 'Web Serial is not available in this browser.'; render(); return; }
+  try { open(await navigator.serial.requestPort()); } catch (e) { msg = 'No port chosen.'; render(); }
+};
+$('run').onclick = async () => {
+  if (!port || running) return;
+  lines = []; last = ''; $('warn').textContent = '';
+  running = true; render();
+  try { await send('probe\n'); } catch (e) { msg = 'Could not send the command. ' + e.message; running = false; render(); }
+};
+$('clear').onclick = () => { lines = []; last = ''; $('warn').textContent = ''; render(); };
+$('copy').onclick = async () => {
+  const text = summarize(lines) + '\n\n' + lines.join('\n');
+  try { await navigator.clipboard.writeText(text); msg = 'Copied ' + lines.length + ' lines.'; }
+  catch (e) { $('out').textContent = text; msg = 'Copy failed, the full text is shown below. Select and copy it.'; }
+  render();
+};
+if ('serial' in navigator) {
+  navigator.serial.getPorts().then((ps) => { if (ps.length) open(ps[0]); }).catch(() => {});
+  navigator.serial.addEventListener('connect', () => { if (!port) navigator.serial.getPorts().then((ps) => { if (ps.length) open(ps[0]); }); });
+}
+render();
+</script>
+</body>
+</html>
