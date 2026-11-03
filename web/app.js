@@ -5,6 +5,7 @@ import { initReplay } from './replay.js';
 import { initRows } from './rows.js';
 import { initCells } from './cells.js';
 import { initView } from './view.js';
+import { initObd } from './obd.js';
 
 const $ = (id) => document.getElementById(id);
 const btn = $('btn'), info = $('info'), warn = $('warn'), body = $('body'), head = $('head');
@@ -20,7 +21,7 @@ let st = {}, lastUp = -1, reboots = 0, dev = '', idsEarly = 0, earlyDone = false
 let status = 'Not connected.', port = null, reader = null, busy = false, wake = null;
 let frameTap = null, evTap = null;   // set by recorder.js
 let replaying = false, replayApi = null;   // set by replay.js
-let rowsApi = null, viewApi = null;   // set by rows.js and view.js
+let rowsApi = null, viewApi = null, obdApi = null;   // set by rows.js, view.js and obd.js
 
 // ---- event log, kept across reloads ----
 let logArr = [];
@@ -185,6 +186,7 @@ function onLine(s) {
   s = s.trim();
   if (!s) return;
   if (s[0] === '#') {
+    if (obdApi && obdApi.onLine(s)) return;   // answers to OBD requests and polling messages
     if (s.startsWith('# stat ')) onStat(s); else { dev = s; ev('dev ' + s.slice(2)); }
     return;
   }
@@ -365,8 +367,20 @@ async function connect(p) {
     btn.textContent = 'Connect';
     if (status === 'Connected.') status = 'Disconnected.';
     ev('disconnected ' + why);
+    if (obdApi) obdApi.disconnected();
     if (wake) wake.release();
   }
+}
+
+// Writes to the board, one at a time. A second write while one is running would be refused.
+let sendChain = Promise.resolve();
+function send(text) {
+  sendChain = sendChain.then(async () => {
+    if (!port) return;
+    const w = port.writable.getWriter();
+    try { await w.write(new TextEncoder().encode(text)); } finally { w.releaseLock(); }
+  }).catch((e) => ev('send failed ' + (e.message || e)));
+  return sendChain;
 }
 
 async function tryAuto() {
@@ -397,6 +411,7 @@ initCells({
   getCols: () => cols, rebuild: rebuildCols, preview: previewCell,
   check: (s) => { const x = fnFor(s); return x instanceof Error ? x.message : ''; },
 });
+obdApi = initObd({ send, ev, isLive: () => reader !== null });
 initRecorder({ ev, setFrameTap: (f) => { frameTap = f; }, setEvTap: (f) => { evTap = f; }, onPlay: (b, n) => replayApi && replayApi.play(b, n) });
 replayApi = initReplay({
   ev,
