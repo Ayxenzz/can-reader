@@ -1,10 +1,11 @@
-import { compile, run, show } from './formula.js';
 import { initExtras } from './extras.js';
 import { initRecorder } from './recorder.js';
 import { initReplay } from './replay.js';
 import { initRows } from './rows.js';
 import { initCells } from './cells.js';
 import { initView } from './view.js';
+import { makeColumns } from './fcols.js';
+import { initOtable } from './otable.js';
 import { initObd } from './obd.js';
 
 const $ = (id) => document.getElementById(id);
@@ -21,7 +22,8 @@ let st = {}, lastUp = -1, reboots = 0, dev = '', idsEarly = 0, earlyDone = false
 let status = 'Not connected.', port = null, reader = null, busy = false, wake = null;
 let frameTap = null, evTap = null;   // set by recorder.js
 let replaying = false, replayApi = null;   // set by replay.js
-let rowsApi = null, viewApi = null, obdApi = null;   // set by rows.js, view.js and obd.js
+let rowsApi = null, viewApi = null;   // set by rows.js and view.js
+let obdApi = null, obdTable = null;   // the OBD controller and the OBD table
 
 // ---- event log, kept across reloads ----
 let logArr = [];
@@ -50,113 +52,8 @@ async function getWake() {
 }
 
 // ---- formula columns ----
-// cols is a list of { name, formula, cells } where cells maps a row ID in hex to its own formula.
-let cols = [];
-try { cols = JSON.parse(localStorage.getItem('canreader.cols') || '[]'); } catch (e) {}
+const canCols = makeColumns({ head, rows, dirty, key: 'canreader.cols', legacy: true });
 let tap = null;   // set by extras.js, called when a byte changes
-const compiled = new Map();
-const cbox = document.createElement('div');   // hide and show buttons for columns
-$('clist').after(cbox);
-function fnFor(src) {
-  if (!compiled.has(src)) { try { compiled.set(src, compile(src)); } catch (e) { compiled.set(src, e); } }
-  return compiled.get(src);
-}
-
-function evalSrc(r, src, cache, stack) {
-  const f = fnFor(src);
-  if (f instanceof Error) throw f;
-  return run(f, r, (n) => {
-    const o = cols.find((x) => x.name.toLowerCase() === n);
-    if (!o) throw new Error('no column ' + n);
-    return evalCol(r, o, cache, stack).v;
-  });
-}
-
-function evalCol(r, c, cache, stack) {
-  if (cache[c.name]) return cache[c.name];
-  if (stack.has(c.name)) throw new Error('cycle at ' + c.name);
-  stack.add(c.name);
-  const src = r.hex in c.cells ? c.cells[r.hex] : c.formula;
-  const res = src ? evalSrc(r, src, cache, stack) : { v: NaN, f: null };
-  stack.delete(c.name);
-  return (cache[c.name] = res);
-}
-
-// What a formula gives for this row right now, used by the edit sheet.
-function previewCell(r, src) {
-  try { const x = evalSrc(r, src, {}, new Set()); return show(x.v, x.f) || '(blank)'; }
-  catch (e) { return 'error: ' + e.message; }
-}
-
-function drawUser(r) {
-  const cache = {};
-  cols.forEach((c, i) => {
-    const td = r.ux[i];
-    let t = '', tip = '';
-    try {
-      const x = evalCol(r, c, cache, new Set());
-      t = show(x.v, x.f);
-      const lab = c.labels && c.labels[r.hex];
-      if (lab && t !== '') t = lab + ' ' + t;   // optional label such as speed
-    }
-    catch (e) { t = 'err'; tip = e.message; }
-    if (td._t !== t) { td.textContent = t; td._t = t; td.title = tip; }
-  });
-}
-
-function userCells(r) {
-  (r.ux || []).forEach((td) => td.remove());
-  r.ux = cols.map((c, i) => {
-    const td = document.createElement('td');
-    td._t = ''; td._ci = i;
-    td.style.minWidth = '6ch'; td.style.cursor = 'pointer';
-    if (c.hidden) td.style.display = 'none';
-    r.tr.appendChild(td);
-    return td;
-  });
-  dirty.add(r);
-}
-
-function rebuildCols() {
-  head.querySelectorAll('.uh').forEach((e) => e.remove());
-  cols.forEach((c, i) => {
-    const th = document.createElement('th');
-    th.className = 'uh'; th.textContent = c.name; th._ci = i; th.style.cursor = 'pointer';
-    if (c.hidden) th.style.display = 'none';
-    head.appendChild(th);
-  });
-  const plus = document.createElement('th');   // tap to add a column
-  plus.className = 'uh'; plus.textContent = '+'; plus._plus = true; plus.style.cursor = 'pointer';
-  head.appendChild(plus);
-  for (const r of rows.values()) if (r.tr) userCells(r);
-  cbox.replaceChildren(...cols.map((c) => {
-    const b = document.createElement('button');
-    b.textContent = (c.hidden ? 'Show ' : 'Hide ') + c.name;
-    b.onclick = () => { c.hidden = !c.hidden; rebuildCols(); };   // a hidden column still computes
-    return b;
-  }));
-  $('clist').textContent = cols.map((c) => c.name + ' = ' + (c.formula || '(rows below only)') +
-    Object.keys(c.cells).map((k) => '\n   ' + k + ': ' + c.cells[k]).join('')).join('\n') || 'No columns yet.';
-  try { localStorage.setItem('canreader.cols', JSON.stringify(cols)); } catch (e) {}
-}
-
-$('cadd').onclick = () => {
-  const msg = $('cmsg');
-  const name = $('cname').value.trim(), f = $('cf').value.trim();
-  const rid = $('cid').value.trim().toUpperCase().replace(/^0X/, '');
-  if (!name) { msg.textContent = 'Enter a column name.'; return; }
-  if (f) { const x = fnFor(f); if (x instanceof Error) { msg.textContent = x.message; return; } }
-  let c = cols.find((x) => x.name.toLowerCase() === name.toLowerCase());
-  if (!c) {
-    c = { name, formula: '', cells: {}, labels: {} };
-    cols.push(c);
-  }
-  if (rid) { if (f) c.cells[rid] = f; else delete c.cells[rid]; }
-  else if (f) c.formula = f;
-  else cols.splice(cols.indexOf(c), 1);
-  msg.textContent = 'Saved.';
-  rebuildCols();
-};
 
 // ---- parsing ----
 function onStat(s) {
@@ -228,7 +125,7 @@ function makeRow(r) {
   for (let i = 0; i < 8; i++) { const td = mk('', 'b'); td._t = ''; td._b = i; spans.push(td); }
   r.tr = tr;
   r.c = { count, period, spans };
-  userCells(r);
+  canCols.userCells(r);
   if (rowsApi) rowsApi.place(r);
   if (viewApi) viewApi.place(r);
 }
@@ -255,7 +152,7 @@ function paint() {
         hot.set(sp, a + 150);
       }
     }
-    drawUser(r);   // formulas run once per repaint, not once per frame
+    canCols.drawUser(r);   // formulas run once per repaint, not once per frame
   }
   dirty.clear();
   for (const [sp, until] of hot) if (a >= until) { sp.classList.remove('hot'); hot.delete(sp); }
@@ -321,6 +218,7 @@ function resetRun() {
   for (const k in prevs) delete prevs[k];
   t0 = performance.now(); lastT = t0; endT = null; minFps = Infinity; lastByteT = t0; lastFrameT = t0;
   if (rowsApi) rowsApi.reset();
+  if (obdTable) obdTable.reset();
 }
 
 async function connect(p) {
@@ -398,20 +296,21 @@ if ('serial' in navigator) {
 }
 btn.onclick = () => { if (reader) reader.cancel(); else connect(); };
 
-viewApi = initView({ rows });   // builds the built-in header cells, so it runs before the user columns
-rebuildCols();
+viewApi = initView({ rows, scope: '#cantable' });   // builds the built-in header cells, so it runs before the user columns
+canCols.rebuild();
 rowsApi = initRows({ rows, redraw: (r) => dirty.add(r) });
+obdApi = initObd({ send, isLive: () => reader !== null, getTable: () => obdTable });   // its section comes first
+obdTable = initOtable({ head: $('ohead'), body: $('obody'), anchor: logBox, onPoll: () => obdApi.repoll() });
 initExtras({
-  getCols: () => cols, setCols: (c) => { cols = c; rebuildCols(); },
+  getCols: () => canCols.cols, setCols: (c) => canCols.set(c),
   getHidden: () => rowsApi.getHidden(), setHidden: (h) => rowsApi.setHidden(h), showOnly: (k) => rowsApi.showOnly(k),
   getView: () => viewApi.getView(), setView: (v) => viewApi.setView(v),
-  setTap: (f) => { tap = f; }, ev,
+  setTap: (f) => { tap = f; obdTable.setTap(f); }, ev,
+  obd: obdTable,
 });
 initCells({
-  getCols: () => cols, rebuild: rebuildCols, preview: previewCell,
-  check: (s) => { const x = fnFor(s); return x instanceof Error ? x.message : ''; },
+  getCols: () => canCols.cols, rebuild: canCols.rebuild, preview: canCols.preview, check: canCols.check,
 });
-obdApi = initObd({ send, ev, isLive: () => reader !== null });
 initRecorder({ ev, setFrameTap: (f) => { frameTap = f; }, setEvTap: (f) => { evTap = f; }, onPlay: (b, n) => replayApi && replayApi.play(b, n) });
 replayApi = initReplay({
   ev,
