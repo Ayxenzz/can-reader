@@ -20,13 +20,17 @@ const helpers = {
     return v;
   },
   signed: (x, len) => (x >= 2 ** (len - 1) ? x - 2 ** len : x),
+  // dtc(hi, lo) writes a trouble code from its two bytes, for example dtc(0xC1, 0x55) is U0155.
+  dtc: (hi, lo) => (Number.isNaN(hi) || Number.isNaN(lo) ? NaN : 'PCBU'[hi >> 6] + ((hi >> 4) & 3) + (hi & 15).toString(16).toUpperCase() + lo.toString(16).toUpperCase().padStart(2, '0')),
   map: (x, m) => (x in m ? m[x] : '_' in m ? m._ : x),
   round: (x, d = 0) => Math.round(x * 10 ** d) / 10 ** d,
   abs: Math.abs, min: Math.min, max: Math.max,
 };
 
-const VARS = ['b0', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'id', 'dlc', 'ext', 'count', 'period'];
+const NB = 64;   // b0 to b63, so long diagnostic answers can be read too
+const VARS = [...Array.from({ length: NB }, (_, i) => 'b' + i), 'id', 'dlc', 'ext', 'count', 'period'];
 const ARGS = [...VARS, 'col', ...Object.keys(helpers)];
+const HELPER_VALUES = Object.values(helpers);
 const NAMES = new Set([...ARGS, 'none', 'true', 'false']);
 NAMES.delete('col');   // [name] is the only way to reach col
 const TOKEN = /\s+|0x[0-9a-f]+|0b[01]+|\d+(?:\.\d+)?|"[^"\\]*"|'[^'\\]*'|\[[^\]]+\]|[a-z_]\w*|===|!==|==|!=|<=|>=|<<|>>>|>>|&&|\|\||[-+*\/%&|^~<>!?:(),{}]/iy;
@@ -57,9 +61,9 @@ export function run(f, r, col) {
   const saved = fmt;
   fmt = null;
   cur = r.bytes;
-  const b = (i) => (i < r.dlc ? r.bytes[i] : NaN);
-  const v = f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), r.id, r.dlc,
-              r.ext === '1' ? 1 : 0, r.count, r.period, col, ...Object.values(helpers));
+  const bs = new Array(NB);
+  for (let i = 0; i < NB; i++) bs[i] = i < r.dlc ? r.bytes[i] : NaN;
+  const v = f(...bs, r.id, r.dlc, r.ext === '1' ? 1 : 0, r.count, r.period, col, ...HELPER_VALUES);
   const out = { v, f: fmt };
   fmt = saved;
   return out;
@@ -68,7 +72,7 @@ export function run(f, r, col) {
 export function show(v, f) {
   if (typeof v === 'boolean') v = +v;
   if (v === null || v === undefined || (typeof v === 'number' && isNaN(v))) return '';
-  if (typeof v !== 'number') return String(v);
+  if (typeof v !== 'number') return typeof v === 'string' && v.includes('NaN') ? '' : String(v);   // text built from a missing byte stays blank
   if (f === 'h') return Math.round(v).toString(16).toUpperCase();
   if (f === 'b') return Math.round(v).toString(2).padStart(8, '0');
   return String(Number.isInteger(v) ? v : +v.toFixed(3));
