@@ -21,6 +21,11 @@
   td.b { text-align: center; min-width: 2.4ch; transition: background-color 1s linear; }
   td.b.hot { background-color: #e8b400; color: #000; transition: none; }
   td.b.muted { color: #888; background-color: #8883; }
+  h4 { margin: 14px 0 4px; }
+  #obdtable td.data { white-space: normal; max-width: 70vw; }
+  .bb { display: inline-block; min-width: 2.4ch; margin-right: 0.3ch; text-align: center; transition: background-color 1s linear; }
+  .bb.hot { background-color: #e8b400; color: #000; transition: none; }
+  .bb.muted { color: #888; background-color: #8883; }
 </style>
 </head>
 <body>
@@ -33,7 +38,7 @@
   <input id="cid" placeholder="row ID in hex, blank for all rows">
   <input id="cf" placeholder="formula, for example be(b2, b3) * 2">
   <button id="cadd">Save</button><span id="cmsg"></span>
-  <pre>Names b0..b7 id dlc ext count period [column]. Helpers hex dec bin bit field be le signed map round abs min max none. An empty formula removes the cell, or the whole column if the row ID is blank too.</pre>
+  <pre>Names b0..b63 id dlc ext count period [column]. Helpers hex dec bin bit field be le signed map round abs min max dtc none. An empty formula removes the cell, or the whole column if the row ID is blank too.</pre>
   <pre id="clist"></pre>
 </details>
 <details id="logbox">
@@ -42,9 +47,16 @@
   <pre id="log"></pre>
 </details>
 <div class="wrap">
-  <table>
+  <table id="cantable">
     <thead><tr id="head"></tr></thead>
     <tbody id="body"></tbody>
+  </table>
+</div>
+<h4>OBD</h4>
+<div class="wrap">
+  <table id="obdtable">
+    <thead><tr id="ohead"></tr></thead>
+    <tbody id="obody"></tbody>
   </table>
 </div>
 <script type="module" src="app.js"></script>
