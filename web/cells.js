@@ -1,8 +1,9 @@
 // Tap-to-edit. Tap a cell under a formula column to type that row's formula and an optional
 // label. Tap a column header to rename it, set a default formula for every row, hide or delete
 // it. Tap the + at the end of the header row to add a column.
-export function initCells({ getCols, rebuild, check, preview }) {
+export function initCells({ getCols, rebuild, check, preview, head, body }) {
   const $ = (id) => document.getElementById(id);
+  const headEl = head || $('head'), bodyEl = body || $('body');
   const sheet = document.createElement('div');
   sheet.style.cssText = 'position:fixed;left:0;right:0;bottom:0;max-height:75vh;overflow:auto;padding:12px;background:Canvas;color:CanvasText;border-top:1px solid #8886;display:none;z-index:6';
   document.body.appendChild(sheet);
@@ -119,13 +120,13 @@ export function initCells({ getCols, rebuild, check, preview }) {
     rebuild();
   }
 
-  $('body').addEventListener('click', (e) => {
+  bodyEl.addEventListener('click', (e) => {
     const td = e.target.closest && e.target.closest('td');
     if (!td || td._ci === undefined) return;
     const r = td.parentNode._r;
     if (r) openCell(r, td._ci);
   });
-  $('head').addEventListener('click', (e) => {
+  headEl.addEventListener('click', (e) => {
     const th = e.target.closest && e.target.closest('th');
     if (!th) return;
     if (th._plus) addColumn();
