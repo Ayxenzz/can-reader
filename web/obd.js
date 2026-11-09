@@ -251,9 +251,23 @@ export function initObd({ send, isLive, getTable, kaMs = 2000, discoverMs = 3000
   $('obdpreset').onclick = () => { const n = applyPreset(getTable().cols); $('obdpmsg').textContent = ' Added ' + n + ' formulas. Rows fill in as the car answers.'; };
   $('obdreset').onclick = () => { const n = applyPreset(getTable().cols, { overwrite: true }); $('obdpmsg').textContent = ' Reset ' + n + ' formulas.'; };
 
+  // The polling settings, so a profile can carry them.
+  function applySettings(s) {
+    if (!s || typeof s !== 'object') return;
+    const r = parseInt(s.rate, 10);
+    if (r >= 1 && r <= 40) $('obdrate').value = String(r);
+    if (typeof s.codes === 'boolean') $('obdcodes').checked = s.codes;
+    if (typeof s.hon === 'boolean') $('obdhon').checked = s.hon;
+    if (typeof s.hids === 'string') $('obdhids').value = s.hids;
+    readCfg();
+    if (polling && phase === 'poll') sendList();
+  }
+
   render();
   return {
     onLine,
+    getSettings: () => ({ rate: cfg.rate, codes: cfg.codes, hon: cfg.hon, hids: cfg.hids }),
+    setSettings: applySettings,
     repoll: () => { if (polling && phase === 'poll') sendList(); },   // the paused rows changed
     disconnected: () => { if (polling) { idle(); say('Disconnected.'); } },
     state: () => ({ polling, phase, supported: [...supported] }),
