@@ -34,6 +34,12 @@ export function initOtable({ head, body, anchor, onPoll }) {
     if (r) dim(r);
     if (onPoll) onPoll();
   };
+  const setPaused = (list) => {
+    paused = new Set((Array.isArray(list) ? list : []).filter((k) => typeof k === 'string'));
+    savePaused();
+    for (const r of rows.values()) dim(r);
+    if (onPoll) onPoll();
+  };
   const rowsApi = initRows({
     rows, redraw: (r) => dirty.add(r), p: 'o', title: 'OBD rows', body, anchor,
     extraMenu: (r) => [[paused.has(r.key) ? 'Poll this again' : 'Stop polling this', () => togglePoll(r.key)]],
@@ -123,6 +129,7 @@ export function initOtable({ head, body, anchor, onPoll }) {
     feed, rows, cols,
     reset: () => { rows.clear(); dirty.clear(); hot.clear(); body.innerHTML = ''; rowsApi.reset(); },
     paused: () => paused,
+    getPaused: () => [...paused].sort(), setPaused,
     getCols: () => cols.cols, setCols: (c) => cols.set(c),
     getHidden: () => rowsApi.getHidden(), setHidden: (h) => rowsApi.setHidden(h),
     getView: () => viewApi.getView(), setView: (v) => viewApi.setView(v),
