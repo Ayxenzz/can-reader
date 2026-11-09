@@ -306,7 +306,7 @@ initExtras({
   getHidden: () => rowsApi.getHidden(), setHidden: (h) => rowsApi.setHidden(h), showOnly: (k) => rowsApi.showOnly(k),
   getView: () => viewApi.getView(), setView: (v) => viewApi.setView(v),
   setTap: (f) => { tap = f; obdTable.setTap(f); }, ev,
-  obd: obdTable,
+  obd: { ...obdTable, getPoll: () => obdApi.getSettings(), setPoll: (s) => obdApi.setSettings(s) },
 });
 initCells({
   getCols: () => canCols.cols, rebuild: canCols.rebuild, preview: canCols.preview, check: canCols.check,
