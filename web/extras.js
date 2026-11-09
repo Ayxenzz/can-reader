@@ -2,13 +2,14 @@ const KEY = 'canreader.profiles', CUR = 'canreader.profile';
 
 // A profile is { cols, hidden, view } where hidden lists row keys and view holds hidden and muted columns
 // and cells. When the OBD table is given as obd, the profile also holds its own { cols, hidden, view }
-// under obd. Older backups held just the cols array.
+// under obd, plus paused (requests left out of polling) and poll (rate and the polling options).
+// Older backups held just the cols array.
 export function initExtras({ getCols, setCols, getHidden, setHidden, getView, setView, showOnly, setTap, ev, obd }) {
   const $ = (id) => document.getElementById(id);
   const clone = (x) => JSON.parse(JSON.stringify(x));
   const list = (a) => (Array.isArray(a) ? a : []);
   const normView = (v) => ({ hide: list(v && v.hide), mute: list(v && v.mute), cells: list(v && v.cells) });
-  const normObd = (o) => ({ cols: list(o && o.cols), hidden: list(o && o.hidden), view: normView(o && o.view) });
+  const normObd = (o) => ({ cols: list(o && o.cols), hidden: list(o && o.hidden), view: normView(o && o.view), paused: list(o && o.paused), poll: o && o.poll && typeof o.poll === 'object' ? o.poll : null });
   const norm = (p) => {
     const q = Array.isArray(p)
       ? { cols: p, hidden: [], view: normView() }
@@ -21,17 +22,31 @@ export function initExtras({ getCols, setCols, getHidden, setHidden, getView, se
   for (const k of Object.keys(profiles)) profiles[k] = norm(profiles[k]);
   const live = () => {
     const p = { cols: clone(getCols()), hidden: [...getHidden()], view: clone(getView()) };
-    if (obd) p.obd = { cols: clone(obd.getCols()), hidden: [...obd.getHidden()], view: clone(obd.getView()) };
+    if (obd) {
+      p.obd = { cols: clone(obd.getCols()), hidden: [...obd.getHidden()], view: clone(obd.getView()) };
+      if (obd.getPaused) p.obd.paused = [...obd.getPaused()];
+      if (obd.getPoll) p.obd.poll = clone(obd.getPoll());
+    }
     return p;
   };
   if (!profiles[cur]) profiles[cur] = live();
   else {
     setHidden(profiles[cur].hidden); setView(profiles[cur].view);
-    if (obd && profiles[cur].obd) { obd.setHidden(profiles[cur].obd.hidden); obd.setView(profiles[cur].obd.view); }
+    if (obd && profiles[cur].obd) {
+      const o = profiles[cur].obd;
+      obd.setHidden(o.hidden); obd.setView(o.view);
+      if (obd.setPaused && o.paused.length) obd.setPaused(o.paused);
+      if (obd.setPoll && o.poll) obd.setPoll(o.poll);
+    }
   }
   const load = (p) => {
     setCols(clone(p.cols)); setHidden(p.hidden); setView(p.view);
-    if (obd) { const o = p.obd || normObd(); obd.setCols(clone(o.cols)); obd.setHidden(o.hidden); obd.setView(o.view); }
+    if (obd) {
+      const o = p.obd || normObd();
+      obd.setCols(clone(o.cols)); obd.setHidden(o.hidden); obd.setView(o.view);
+      if (obd.setPaused) obd.setPaused(o.paused);
+      if (obd.setPoll && o.poll) obd.setPoll(o.poll);   // a profile without polling settings leaves them as they are
+    }
   };
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(profiles)); localStorage.setItem(CUR, cur); } catch (e) {} };
   const sync = () => { profiles[cur] = live(); };
