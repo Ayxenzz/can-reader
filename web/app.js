@@ -299,7 +299,7 @@ btn.onclick = () => { if (reader) reader.cancel(); else connect(); };
 viewApi = initView({ rows, scope: '#cantable' });   // builds the built-in header cells, so it runs before the user columns
 canCols.rebuild();
 rowsApi = initRows({ rows, redraw: (r) => dirty.add(r) });
-obdApi = initObd({ send, isLive: () => reader !== null, getTable: () => obdTable });   // its section comes first
+obdApi = initObd({ send, ev, isLive: () => reader !== null, getTable: () => obdTable });   // its section comes first
 obdTable = initOtable({ head: $('ohead'), body: $('obody'), anchor: logBox, onPoll: () => obdApi.repoll() });
 initExtras({
   getCols: () => canCols.cols, setCols: (c) => canCols.set(c),
