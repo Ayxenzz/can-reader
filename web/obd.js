@@ -1,7 +1,9 @@
 // OBD controller. Starts and stops polling on the board, asks which PIDs the car supports, builds
 // the poll list from the rows you have not paused, and adds the standard PID formulas to the OBD
 // table. The values themselves are shown by the OBD table, as formula cells you can edit.
-// Every request is a read. The board refuses anything else.
+// Every request that polling sends is a read, and the board refuses anything else. Clearing the
+// trouble codes is a separate button with its own confirmation. It sends one command, "clear codes
+// yes", which makes the board send OBD service 04 once.
 
 // Standard PIDs as formulas. b0 is the first data byte. Each entry is [formula, label], a second
 // entry goes in the second column.
@@ -61,6 +63,28 @@ const TWO_BYTE = new Set(['010C', '0110', '011F', '0121', '0131', '0142', '0143'
 const hex2 = (n) => n.toString(16).toUpperCase().padStart(2, '0');
 const hexBytes = (h) => (h ? h.match(/../g).map((x) => parseInt(x, 16)) : []);
 
+// The codes in a stored, pending or permanent answer. bytes are the data bytes, a count and then
+// two bytes per code.
+export function codeList(bytes) {
+  const out = [];
+  const n = bytes.length ? bytes[0] : 0;
+  for (let i = 1; i + 1 < bytes.length && out.length < n; i += 2) {
+    const hi = bytes[i], lo = bytes[i + 1];
+    if (!hi && !lo) continue;
+    out.push('PCBU'[hi >> 6] + ((hi >> 4) & 3) + (hi & 15).toString(16).toUpperCase() + hex2(lo));
+  }
+  return out;
+}
+
+// What the car's refusal codes mean, for the service 04 request.
+const REFUSALS = {
+  0x11: 'The car does not support clearing codes this way.',
+  0x12: 'The car does not support clearing codes this way.',
+  0x21: 'The engine computer is busy. Wait a moment and try again.',
+  0x22: 'The car refused because conditions are not right. Turn the engine off, leave the ignition on, and try again.',
+  0x31: 'The car does not support clearing codes this way.',
+};
+
 // Writes the standard formulas into the table's formula columns. Cells you already have are kept
 // unless overwrite is set. Returns how many cells were written.
 export function applyPreset(colsApi, { overwrite = false } = {}) {
@@ -109,12 +133,14 @@ export function buildList(supported, { codes, honda, paused }) {
   return { list: kept, dropped: wanted.length - kept.length };
 }
 
-export function initObd({ send, isLive, getTable, kaMs = 2000, discoverMs = 3000 }) {
+export function initObd({ send, isLive, getTable, ev, kaMs = 2000, discoverMs = 3000, idleWaitMs = 2500, clearWaitMs = 8000 }) {
   const $ = (id) => document.getElementById(id);
   const store = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) || d; } catch (e) { return d; } };
   const keep = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
   const cfg = Object.assign({ rate: 20, codes: true, hon: false, hids: '2610 2612 2660' }, store('canreader.obd', {}));
   let supported = new Set(), pages = {}, phase = 'off', msg = 'Off.', kaTimer = 0, discTimer = 0, renderTimer = 0, polling = false;
+  let clearing = false, resumeAfter = false, clearTimer = 0, idleResolve = null, clearNote = '';
+  const log = (m) => { if (ev) ev(m); };
 
   const det = document.createElement('details');
   det.innerHTML = `<summary>OBD polling</summary>
@@ -123,7 +149,8 @@ export function initObd({ send, isLive, getTable, kaMs = 2000, discoverMs = 3000
     <label><input type="checkbox" id="obdhon" style="width:auto;margin:0 6px 0 0">Poll Honda data</label>
     <input id="obdhids" placeholder="Honda requests, for example 2610 2612 2660">
     <input id="obdrate" placeholder="requests per second, 1 to 40">
-    <button id="obdpreset">Add standard PID formulas</button><button id="obdreset">Reset them to the standard ones</button><span id="obdpmsg"></span>
+    <button id="obdpreset">Add standard PID formulas</button><button id="obdreset">Reset them to the standard ones</button><span id="obdpmsg"></span><br>
+    <button id="obdclear">Clear trouble codes and warning light</button><span id="obdcmsg"></span>
     <details><summary>Find a value in the Honda rows</summary>
       <select id="obdfrow"></select>
       <input id="obdfval" placeholder="raw value to find, decimal or 0x hex">
@@ -199,7 +226,9 @@ export function initObd({ send, isLive, getTable, kaMs = 2000, discoverMs = 3000
   // ---- lines from the board ----
   const OKBYTE = { '01': 0x41, '22': 0x62, '03': 0x43, '07': 0x47, '0A': 0x4a };
   function onLine(s) {
+    if (s.startsWith('# clear')) { onClear(s); return true; }
     if (s.startsWith('# poll')) {
+      if (/^# poll (stopped|aborted|cannot|restart)/.test(s) && idleResolve) idleResolve();
       if (/^# poll (stopped|aborted|cannot|refused|no answers|restart)/.test(s) && polling && !/^# poll stopped$/.test(s)) idle();
       if (/^# poll (rejected|refused|no answers|aborted|cannot|stopped, )/.test(s)) say(s.slice(2));
       else later();
@@ -250,6 +279,60 @@ export function initObd({ send, isLive, getTable, kaMs = 2000, discoverMs = 3000
   };
   $('obdpreset').onclick = () => { const n = applyPreset(getTable().cols); $('obdpmsg').textContent = ' Added ' + n + ' formulas. Rows fill in as the car answers.'; };
   $('obdreset').onclick = () => { const n = applyPreset(getTable().cols, { overwrite: true }); $('obdpmsg').textContent = ' Reset ' + n + ' formulas.'; };
+
+  // ---- clearing the trouble codes ----
+  const cmsg = (m) => { $('obdcmsg').textContent = '  ' + m; };
+  const waitIdle = (ms) => new Promise((res) => {
+    idleResolve = () => { idleResolve = null; res(true); };
+    setTimeout(() => { if (idleResolve) { idleResolve = null; res(false); } }, ms);
+  });
+  async function clearCodes() {
+    if (clearing) return;
+    if (!isLive()) { cmsg('Connect to the board first.'); return; }
+    const t = getTable(), names = { '03': 'Stored', '07': 'Pending', '0A': 'Permanent' };
+    const known = t ? ['03', '07', '0A'].filter((k) => t.rows.has(k)).map((k) => names[k] + ': ' + (codeList(t.rows.get(k).bytes).join(' ') || 'none')) : [];
+    const text = 'Clear the trouble codes and turn the warning light off?\n\n' +
+      (known.length ? 'Codes right now:\n' + known.join('\n') + '\n\n' : 'The codes are not on screen. Start polling first if you want to see them before they are erased.\n\n') +
+      'This also erases the freeze frame data and resets the emission readiness monitors, so an emissions test can report "not ready" until you have driven a few trips. The light comes back if the fault is still there. Permanent codes are not erased. Write the codes down first.\n\n' +
+      'The engine should be off, with the ignition on.';
+    if (!confirm(text)) return;
+    clearing = true;
+    resumeAfter = polling;
+    clearNote = '';
+    cmsg('Clearing...');
+    if (polling) { await stop('Polling stopped to clear the codes.'); await waitIdle(idleWaitMs); }
+    log('clear codes requested, ' + (known.join('; ') || 'codes not on screen'));
+    clearTimer = setTimeout(() => {
+      if (!clearing) return;
+      clearing = false;
+      cmsg('The board did not answer. The clear command needs the newest firmware.');
+      log('clear codes: no answer from the board');
+    }, clearWaitMs);
+    await send('clear codes yes\n');
+  }
+  function onClear(s) {
+    const fin = (m, tag) => { clearNote = m; cmsg(m); log('clear codes: ' + (tag || m)); };
+    if (/^# clear (queued|start)/.test(s)) { cmsg('Sent to the car...'); return; }
+    if (s === '# clear ok') { clearTimeout(clearTimer); fin('The car accepted it. Codes cleared and the warning light should go off. Start polling to read them again.', 'ok'); return; }
+    let m;
+    if ((m = /^# clear neg ([0-9A-F]{2})$/.exec(s))) {
+      clearTimeout(clearTimer);
+      fin(REFUSALS[parseInt(m[1], 16)] || 'The car refused (code ' + m[1] + ').', 'refused ' + m[1]);
+      return;
+    }
+    if (s === '# clear none') { clearTimeout(clearTimer); fin('The engine computer did not answer.', 'no answer'); return; }
+    if (s === '# clear bad') { clearTimeout(clearTimer); fin('The engine computer gave an unexpected answer. Nothing was confirmed.', 'unexpected answer'); return; }
+    if (s === '# clear busy') { clearTimeout(clearTimer); fin('The board is busy. Try again in a moment.', 'board busy'); clearing = false; return; }
+    if (s === '# clear too soon') { clearTimeout(clearTimer); fin('Wait ten seconds between clears.', 'too soon'); clearing = false; return; }
+    if (s === '# clear done') {
+      clearing = false;
+      if (resumeAfter) { resumeAfter = false; start(); }
+      return;
+    }
+    clearTimeout(clearTimer); clearing = false;   // rejected, refused, cannot start, restart failed
+    fin(s.slice(2), s.slice(2));
+  }
+  $('obdclear').onclick = clearCodes;
 
   // The polling settings, so a profile can carry them.
   function applySettings(s) {
