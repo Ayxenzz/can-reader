@@ -4,7 +4,10 @@
 //   probe                    one pass over standard OBD-II and Honda service 22, "# probe" lines
 //   poll <rate> <req> ...    a steady rotation of requests, "# obd" lines, until "poll off"
 //   ka                       keepalive, polling stops by itself 6 seconds after the last one
-// Only these services are accepted, nothing that writes, clears or controls.
+//   clear codes yes          sends service 04 once, which erases the trouble codes and turns the
+//                            warning light off. It must be sent in full as shown.
+// Probing and polling only ever read. They refuse service 04 and every other service that writes,
+// clears or controls. Clearing is the one separate, deliberate command above.
 //
 // Frame line   ts_us,id_hex,ext,dlc,data_hex
 // Status line  # stat key=value key=value ...   once per second
@@ -59,6 +62,8 @@ static volatile bool scanning = false;
 static volatile bool probing = false;
 static volatile bool probeReq = false;
 static volatile bool polling = false;
+static volatile bool clearReq = false;
+static volatile bool clearing = false;
 static volatile uint32_t sState = 0, sTec = 0, sRec = 0, sBusErr = 0, sMissed = 0, sRxq = 0, sRecov = 0;
 
 // USB side state, used only by loop().
@@ -543,6 +548,36 @@ static void runPoll() {
   pline("# poll %s", why);
 }
 
+// ---- clearing trouble codes ----------------------------------------------------------------
+// OBD-II service 04, the same request any scan tool sends. It asks the engine ECU to erase its stored
+// and pending codes and its freeze frame data. That turns the warning light off and resets the
+// emission readiness monitors, and the light returns if the fault is still there. It is sent once,
+// only for the exact command "clear codes yes", and never from a poll list.
+static void runClear() {
+  clearing = true;
+  probeTxFail = 0;
+  pline("# clear start");
+  canStop();
+  if (!canStart(rateIdx, TWAI_MODE_NORMAL)) {
+    pline("# clear cannot start normal mode");
+    canStart(rateIdx, TWAI_MODE_LISTEN_ONLY);
+    clearing = false;
+    return;
+  }
+  const uint8_t req[1] = {0x04};
+  uint8_t nrc = 0;
+  int st = request(reqId(POLLREQ_ECU), rspId(POLLREQ_ECU), req, 1, 2500, &nrc);
+  if (st == RX_OK) pline("# clear ok");
+  else if (st == RX_NEG) pline("# clear neg %02X", nrc);
+  else if (st == RX_NONE) pline("# clear none");
+  else pline("# clear bad");
+  idle(100);
+  canStop();
+  if (!canStart(rateIdx, TWAI_MODE_LISTEN_ONLY)) pline("# clear restart failed");
+  clearing = false;
+  pline("# clear done");
+}
+
 static void canTask(void *) {
   scanning = true;
   int best = autobaud();
@@ -563,6 +598,12 @@ static void canTask(void *) {
       probeReq = false;
       if (now - lastFrame < 2000) { runProbe(); lastFrame = millis(); lastSnap = 0; }
       else note("# probe refused, no bus traffic");
+      continue;
+    }
+    if (clearReq) {
+      clearReq = false;
+      if (now - lastFrame < 2000) { runClear(); lastFrame = millis(); lastSnap = 0; }
+      else note("# clear refused, no bus traffic");
       continue;
     }
     if (pollStageReady) {
@@ -593,6 +634,7 @@ static const char *resetName() {
 static const char *stateName(uint32_t s) {
   if (probing) return "PROBING";
   if (polling) return "POLLING";
+  if (clearing) return "CLEARING";
   if (scanning) return "SCANNING";
   switch (s) {
     case TWAI_STATE_STOPPED: return "STOPPED";
@@ -637,12 +679,15 @@ static void printStat() {
   maxGap = 0;
 }
 
-// Commands from the page, one per line: probe, poll <rate> <req> ..., poll off, ka.
+// Commands from the page, one per line: probe, poll <rate> <req> ..., poll off, ka, clear codes yes.
 static char cmdBuf[400];
 static uint16_t cmdN = 0;
+static uint32_t lastClearAt = 0;
+static bool clearedOnce = false;
 
 static void handlePoll(char *args) {
   if (probing) { Serial.println("# poll busy, probe running"); return; }
+  if (clearing || clearReq) { Serial.println("# poll busy, clearing"); return; }
   if (pollStageReady) { Serial.println("# poll busy"); return; }
   PollCfg c;
   memset(&c, 0, sizeof(c));
@@ -680,12 +725,18 @@ static void pollCommands() {
       cmdBuf[cmdN] = 0;
       cmdN = 0;
       if (!strcmp(cmdBuf, "probe")) {
-        if (probing || probeReq || polling) Serial.println("# probe already running or polling");
+        if (probing || probeReq || polling || clearReq || clearing) Serial.println("# probe already running or polling");
         else { probeReq = true; Serial.println("# probe queued"); }
       } else if (!strcmp(cmdBuf, "ka")) {
         pollKa = millis();
       } else if (!strncmp(cmdBuf, "poll ", 5)) {
         handlePoll(cmdBuf + 5);
+      } else if (!strcmp(cmdBuf, "clear codes yes")) {
+        if (probing || probeReq || polling || pollStageReady || clearReq || clearing) Serial.println("# clear busy");
+        else if (clearedOnce && (uint32_t)(millis() - lastClearAt) < 10000) Serial.println("# clear too soon");
+        else { clearReq = true; clearedOnce = true; lastClearAt = millis(); Serial.println("# clear queued"); }
+      } else if (!strncmp(cmdBuf, "clear", 5)) {
+        Serial.println("# clear rejected, send exactly: clear codes yes");
       }
     } else if (cmdN < sizeof(cmdBuf) - 1) {
       cmdBuf[cmdN++] = ch;
